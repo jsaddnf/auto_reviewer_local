@@ -1,0 +1,720 @@
+#!/bin/bash
+# autoreviewer - main CLI dispatcher
+#
+# Subcommands:
+#   enable [--repo PATH]      enable globally or for a specific repo
+#   disable [--repo PATH]     disable globally or for a specific repo
+#   status                    show current state
+#   run [<commit>] [opts]     manually trigger a review (default: HEAD, sync)
+#   log [-n N] [--severity X] list recent reviews
+#   show [<hash>] [--open]    show a specific review
+#   clean [--all|--older-than Xd]  clean up review files
+#   cancel                    kill the currently running review
+#   uninstall                 uninstall autoreviewer
+
+set -u
+
+AUTOREVIEWER_HOME="${AUTOREVIEWER_HOME:-$HOME/.autoreviewer}"
+GLOBAL_CONFIG="$AUTOREVIEWER_HOME/config.json"
+
+if [ -f "$AUTOREVIEWER_HOME/lib/config.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$AUTOREVIEWER_HOME/lib/config.sh"
+fi
+
+# ---------- helpers ----------
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+require_repo() {
+    git rev-parse --git-dir >/dev/null 2>&1 || die "not in a git repository"
+}
+
+cmd_help() {
+    cat <<'EOF'
+autoreviewer - automatic code review on every commit
+
+USAGE
+  autoreviewer <command> [options]
+
+COMMANDS
+  install [--repo PATH] [--uninstall]
+                                  Set up the trigger for current/given repo.
+                                  Handles repos that override core.hooksPath
+                                  (Husky, Lefthook, project .githooks, etc.)
+  enable [--repo PATH]            Enable autoreviewer (globally or for a repo)
+  disable [--repo PATH]           Disable autoreviewer (globally or for a repo)
+  status                          Show current state and config
+  run [<commit>] [options]        Manually trigger a review
+                                    --async       run in background
+                                    --no-notify   skip notification
+                                    --open        open .md when done
+  log [-n N] [--severity LEVEL]   List recent reviews in current repo
+  show [<hash>] [options]         Show a review
+                                    --open        open in default app
+                                    --json        print raw JSON
+  clean --all | --older-than 30d  Clean up review files in current repo
+  cancel                          Kill the currently running review
+  uninstall                       Uninstall autoreviewer entirely
+  help                            Show this help
+
+ENVIRONMENT
+  AUTOREVIEWER_SKIP=1 git commit  Skip review for a single commit
+EOF
+}
+
+# ---------- enable / disable ----------
+
+cmd_enable() {
+    local repo=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    if [ -n "$repo" ]; then
+        cd "$repo" || die "cannot cd to $repo"
+        require_repo
+        ar_config_set_repo enabled true
+        local abs
+        abs=$(pwd)
+        ar_blacklist_remove "$abs"
+        echo "✅ enabled for repo: $abs"
+    else
+        ar_config_set_global enabled true
+        echo "✅ globally enabled"
+    fi
+}
+
+cmd_disable() {
+    local repo=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    if [ -n "$repo" ]; then
+        cd "$repo" || die "cannot cd to $repo"
+        require_repo
+        ar_config_set_repo enabled false
+        local abs
+        abs=$(pwd)
+        ar_blacklist_add "$abs"
+        echo "🛑 disabled for repo: $abs"
+    else
+        ar_config_set_global enabled false
+        echo "🛑 globally disabled"
+    fi
+}
+
+# ---------- status ----------
+
+cmd_status() {
+    echo "autoreviewer"
+    echo "============"
+    echo "Tool home:    $AUTOREVIEWER_HOME"
+
+    local cmd
+    cmd=$(ar_config_get command)
+    echo "Review tool:  ${cmd:-claude}"
+
+    local global_enabled
+    if [ -f "$GLOBAL_CONFIG" ]; then
+        global_enabled=$(jq -r '.enabled // true' "$GLOBAL_CONFIG" 2>/dev/null)
+    else
+        global_enabled="true"
+    fi
+    if [ "$global_enabled" = "true" ]; then
+        echo "Master switch: ON   (autoreviewer disable to pause everywhere)"
+    else
+        echo "Master switch: OFF 🛑 (autoreviewer enable to resume)"
+    fi
+
+    # Legacy global hook check — still report if user has it from old install
+    local global_hp
+    global_hp=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
+    if [ "$global_hp" = "$AUTOREVIEWER_HOME/hooks" ] || [ "$global_hp" = "$AUTOREVIEWER_HOME/hooks/" ]; then
+        echo "Global hook:  $global_hp  (legacy global install — every repo on this machine inherits autoreviewer)"
+    fi
+
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        echo ""
+        echo "(Not in a git repo — cd into one and run 'autoreviewer status' to check it.)"
+        return 0
+    fi
+
+    local repo
+    repo=$(git rev-parse --show-toplevel)
+    echo ""
+    echo "Current repo: $repo"
+
+    # Determine install state for this repo
+    local local_hp effective effective_abs our_hooks
+    our_hooks="$AUTOREVIEWER_HOME/hooks"
+    local_hp=$(git config --local --get core.hooksPath 2>/dev/null || echo "")
+    effective=$(git config --get core.hooksPath 2>/dev/null || echo "")
+    effective_abs="$effective"
+    if [ -n "$effective" ] && [[ "$effective" != /* ]]; then
+        effective_abs="$repo/$effective"
+    fi
+    effective_abs="${effective_abs%/}"
+    our_hooks="${our_hooks%/}"
+
+    # Read chained_hooks_path from .git/autoreviewer.json
+    local repo_cfg chained
+    repo_cfg="$(git rev-parse --absolute-git-dir)/autoreviewer.json"
+    chained=""
+    if [ -f "$repo_cfg" ]; then
+        chained=$(jq -r '.chained_hooks_path // empty' "$repo_cfg" 2>/dev/null)
+    fi
+
+    if [ -z "$effective" ]; then
+        echo "  install state: not installed ❌"
+        echo "    No hook will run. Fix: autoreviewer install"
+    elif [ "$effective_abs" = "$our_hooks" ]; then
+        if [ -n "$chained" ]; then
+            echo "  install state: installed ✅ (chain mode → $chained)"
+        elif [ -n "$local_hp" ]; then
+            echo "  install state: installed ✅ (local core.hooksPath → $our_hooks)"
+        else
+            echo "  install state: inherited from global ✅"
+        fi
+    else
+        # Effective hooksPath is something else (Husky / Lefthook / .githooks)
+        # Check for legacy shim in that directory
+        local legacy="$effective_abs/post-commit"
+        if [ -f "$legacy" ] && grep -q "\.autoreviewer/hooks/post-commit" "$legacy" 2>/dev/null; then
+            echo "  install state: installed (legacy shim) ⚠️"
+            echo "    Found old-style shim: $legacy"
+            echo "    Recommended: autoreviewer install --upgrade"
+            echo "      (chain mode keeps your project's tracked files clean)"
+        else
+            echo "  install state: NOT installed ⚠️"
+            echo "    This repo's hooksPath = $effective_abs"
+            echo "    Fix: autoreviewer install"
+            echo "      (will switch to chain mode — no tracked files modified)"
+        fi
+    fi
+
+    # Per-repo on/off (independent from install state)
+    if ar_is_enabled "$repo"; then
+        echo "  per-repo switch: ON  (autoreviewer disable --repo . to pause this repo)"
+    else
+        echo "  per-repo switch: OFF 🛑 (autoreviewer enable --repo .)"
+    fi
+
+    local count
+    count=$(find "$(git rev-parse --git-dir)/reviews" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+    echo "  reviews:       $count stored"
+}
+
+# ---------- run ----------
+
+cmd_run() {
+    require_repo
+    local commit="HEAD"
+    local mode="--sync"  # default sync for manual invocation
+    local extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --async) mode=""; shift ;;
+            --sync) mode="--sync"; shift ;;
+            --no-notify) extra+=("--no-notify"); shift ;;
+            --open) extra+=("--open"); shift ;;
+            -h|--help) echo "Usage: autoreviewer run [<commit>] [--async|--sync] [--no-notify] [--open]"; return 0 ;;
+            -*) die "unknown option: $1" ;;
+            *) commit="$1"; shift ;;
+        esac
+    done
+
+    if [ "$mode" = "--sync" ]; then
+        python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" --sync "${extra[@]}"
+    else
+        # Async: detach
+        local repo_root
+        repo_root=$(git rev-parse --show-toplevel)
+        local log_file="$repo_root/.git/reviews/.last-run.log"
+        mkdir -p "$(dirname "$log_file")"
+        (
+            cd "$repo_root" || exit 1
+            nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" "${extra[@]}" \
+                > "$log_file" 2>&1 &
+            disown
+        )
+        echo "🔄 review started in background (log: $log_file)"
+    fi
+}
+
+# ---------- log ----------
+
+cmd_log() {
+    require_repo
+    local n=20
+    local sev_filter=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n) n="$2"; shift 2 ;;
+            --severity) sev_filter="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    local index_file
+    index_file="$(git rev-parse --git-dir)/reviews/index.json"
+    if [ ! -f "$index_file" ]; then
+        echo "No reviews yet."
+        return 0
+    fi
+
+    printf '%-9s %-17s %-12s %-50s %s\n' "HASH" "DATE" "SEVERITY" "COMMIT" "ISSUES"
+
+    local jq_filter='.[] | "\(.hash)|\(.date)|\(.severity)|\(.message)|\(.issue_count)"'
+    if [ -n "$sev_filter" ]; then
+        jq_filter='.[] | select(.severity == "'"$sev_filter"'") | "\(.hash)|\(.date)|\(.severity)|\(.message)|\(.issue_count)"'
+    fi
+
+    # Reverse with awk (portable across macOS/Linux), then take last n
+    jq -r "$jq_filter" "$index_file" 2>/dev/null \
+      | awk '{a[NR]=$0} END{for(i=NR;i>0;i--) print a[i]}' \
+      | head -n "$n" \
+      | while IFS='|' read -r hash date severity message issues; do
+            local emoji
+            case "$severity" in
+                high) emoji="🔴" ;;
+                medium|low) emoji="🟡" ;;
+                ok) emoji="🟢" ;;
+                *) emoji="⚪" ;;
+            esac
+            # Truncate ISO date to YYYY-MM-DD HH:MM
+            date="${date:0:16}"
+            date="${date/T/ }"
+            printf '%-9s %-17s %s %-10s %-50.50s %s\n' "$hash" "$date" "$emoji" "$severity" "$message" "$issues"
+        done
+}
+
+# ---------- show ----------
+
+cmd_show() {
+    require_repo
+    local hash=""
+    local open_it=0
+    local json_mode=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --open) open_it=1; shift ;;
+            --json) json_mode=1; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) hash="$1"; shift ;;
+        esac
+    done
+
+    local reviews_dir
+    reviews_dir="$(git rev-parse --git-dir)/reviews"
+
+    local file
+    if [ -z "$hash" ]; then
+        # Latest
+        file=$(ls -t "$reviews_dir"/*.md 2>/dev/null | head -1)
+    else
+        file=$(ls -t "$reviews_dir"/*"${hash}"*.md 2>/dev/null | head -1)
+    fi
+
+    [ -z "$file" ] && die "no review found"
+
+    if [ "$json_mode" = "1" ]; then
+        cat "${file%.md}.json"
+        return 0
+    fi
+
+    if [ "$open_it" = "1" ]; then
+        open "$file"
+        return 0
+    fi
+
+    if command -v glow >/dev/null 2>&1; then
+        glow "$file"
+    elif command -v bat >/dev/null 2>&1; then
+        bat --style=plain --language=md "$file"
+    else
+        cat "$file"
+    fi
+}
+
+# ---------- clean ----------
+
+cmd_clean() {
+    require_repo
+    local mode=""
+    local age=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all) mode="all"; shift ;;
+            --older-than) age="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    local reviews_dir
+    reviews_dir="$(git rev-parse --git-dir)/reviews"
+    [ ! -d "$reviews_dir" ] && { echo "Nothing to clean."; return 0; }
+
+    if [ "$mode" = "all" ]; then
+        echo "About to delete all reviews in: $reviews_dir"
+        read -rp "Proceed? [y/N] " yn
+        [ "$yn" = "y" ] || [ "$yn" = "Y" ] || { echo "Cancelled."; return 0; }
+        rm -f "$reviews_dir"/*.{json,md,raw.txt} "$reviews_dir/index.json"
+        echo "🧹 Cleaned."
+    elif [ -n "$age" ]; then
+        # parse "30d" / "7d"
+        local days="${age%d}"
+        [[ "$days" =~ ^[0-9]+$ ]] || die "invalid --older-than (use e.g. 30d)"
+        find "$reviews_dir" -maxdepth 1 \( -name "*.md" -o -name "*.json" -o -name "*.raw.txt" \) -mtime +"$days" -print -delete
+        echo "🧹 Cleaned files older than ${days}d."
+    else
+        die "specify --all or --older-than Xd"
+    fi
+}
+
+# ---------- cancel ----------
+
+cmd_cancel() {
+    require_repo
+    local pid_file
+    pid_file="$(git rev-parse --git-dir)/reviews/.running.pid"
+    if [ -f "$pid_file" ]; then
+        local pid
+        pid=$(cat "$pid_file")
+        if kill "$pid" 2>/dev/null; then
+            echo "🛑 Killed review process $pid"
+            rm -f "$pid_file"
+        else
+            echo "Process $pid not running. Cleaning up stale pid file."
+            rm -f "$pid_file"
+        fi
+    else
+        echo "No review currently running."
+    fi
+}
+
+# ---------- install (per-repo trigger) ----------
+
+# Marker used to find/remove our trigger in third-party post-commit files
+AR_MARKER_BEGIN="# >>> autoreviewer trigger >>>"
+AR_MARKER_END="# <<< autoreviewer trigger <<<"
+
+cmd_install() {
+    local repo=""
+    local uninstall=0
+    local upgrade=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            --uninstall) uninstall=1; shift ;;
+            --upgrade) upgrade=1; shift ;;
+            -h|--help)
+                echo "Usage: autoreviewer install [--repo PATH] [--uninstall|--upgrade]"
+                echo ""
+                echo "Enables autoreviewer for one git repo (the canonical workflow)."
+                echo ""
+                echo "Two cases handled automatically:"
+                echo "  1. Vanilla repo (no local core.hooksPath):"
+                echo "       sets local core.hooksPath = ~/.autoreviewer/hooks"
+                echo "  2. Repo overrides core.hooksPath (Husky / Lefthook / project .githooks):"
+                echo "       installs a small shim into that directory's post-commit"
+                echo ""
+                echo "--uninstall reverses the change (cleanly, by case)."
+                return 0 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    if [ -n "$repo" ]; then
+        cd "$repo" || die "cannot cd to $repo"
+    fi
+    require_repo
+
+    local repo_root our_hooks
+    repo_root=$(git rev-parse --show-toplevel)
+    our_hooks="$AUTOREVIEWER_HOME/hooks"
+
+    # Read both local and effective hooksPath
+    local local_hp effective
+    local_hp=$(git config --local --get core.hooksPath 2>/dev/null || echo "")
+    effective=$(git config --get core.hooksPath 2>/dev/null || echo "")
+
+    # Resolve effective to absolute for safe comparison
+    local effective_abs="$effective"
+    if [ -n "$effective" ] && [[ "$effective" != /* ]]; then
+        effective_abs="$repo_root/$effective"
+    fi
+    effective_abs="${effective_abs%/}"
+    local our_hooks_norm="${our_hooks%/}"
+
+    # Read chained_hooks_path from .git/autoreviewer.json if present —
+    # this is the authoritative signal that we're in chain mode (Case A).
+    local repo_git_dir repo_cfg saved_chain
+    repo_git_dir=$(git rev-parse --absolute-git-dir)
+    repo_cfg="$repo_git_dir/autoreviewer.json"
+    saved_chain=""
+    if [ -f "$repo_cfg" ]; then
+        saved_chain=$(jq -r '.chained_hooks_path // empty' "$repo_cfg" 2>/dev/null)
+    fi
+
+    # ---------- Case A: chain mode (already installed OR will install via chain) ----------
+    # Trigger Case A if EITHER:
+    #   (a) we already saved a chained_hooks_path (i.e. we previously installed via chain)
+    #   (b) the repo overrides hooksPath to something other than us
+    if [ -n "$saved_chain" ] || ([ -n "$local_hp" ] && [ "$effective_abs" != "$our_hooks_norm" ]); then
+        # Determine the original_hp: either the saved chain or the current local_hp
+        local original_hp="${saved_chain:-$local_hp}"
+
+        if [ "$uninstall" = "1" ]; then
+            _ar_chain_uninstall "$repo_root"
+            return 0
+        fi
+        if [ "$upgrade" = "1" ]; then
+            _ar_chain_upgrade "$repo_root" "$original_hp"
+            return 0
+        fi
+
+        # First-time install: warn about leftover legacy shim
+        local override_abs="$original_hp"
+        if [[ "$override_abs" != /* ]]; then
+            override_abs="$repo_root/$override_abs"
+        fi
+        local legacy_shim="$override_abs/post-commit"
+        if [ -z "$saved_chain" ] && [ -f "$legacy_shim" ] && grep -q "\.autoreviewer/hooks/post-commit" "$legacy_shim" 2>/dev/null; then
+            echo "⚠️  Detected a legacy autoreviewer shim from an older version:"
+            echo "     $legacy_shim"
+            echo "   Run: autoreviewer install --upgrade   to migrate cleanly."
+            return 1
+        fi
+
+        _ar_chain_install "$repo_root" "$original_hp"
+        return 0
+    fi
+
+    # ---------- Case B: vanilla repo (we set local hooksPath ourselves) ----------
+    if [ "$uninstall" = "1" ]; then
+        if [ "$effective_abs" = "$our_hooks_norm" ] && [ -n "$local_hp" ]; then
+            git config --local --unset core.hooksPath
+            echo "🧹 unset local core.hooksPath (autoreviewer disabled for this repo)"
+        else
+            echo "ℹ️  Nothing to remove — repo isn't using our local hooksPath."
+        fi
+        return 0
+    fi
+
+    if [ "$effective_abs" = "$our_hooks_norm" ]; then
+        echo "✅ already installed (local core.hooksPath → $our_hooks)"
+        return 0
+    fi
+
+    # Set it
+    git config --local core.hooksPath "$our_hooks"
+    echo "✅ installed for repo: $repo_root"
+    echo "   set local core.hooksPath = $our_hooks"
+    echo ""
+    echo "Test it:"
+    echo "  git commit --allow-empty -m 'test: autoreviewer'"
+}
+
+# ---------- new chain-based helpers (no tracked-file modifications) ----------
+
+# Save chained hooks path to <repo>/.git/autoreviewer.json and switch local
+# core.hooksPath to ours.
+# Args: <repo_root> <original_hooks_path>
+_ar_chain_install() {
+    local repo_root="$1"
+    local original_hp="$2"
+    local our_hooks="$AUTOREVIEWER_HOME/hooks"
+    local git_dir cfg
+    git_dir=$(cd "$repo_root" && git rev-parse --absolute-git-dir)
+    cfg="$git_dir/autoreviewer.json"
+
+    # Idempotency: if already pointing at us AND chained_hooks_path saved, done
+    local effective
+    effective=$(cd "$repo_root" && git config --local --get core.hooksPath 2>/dev/null || echo "")
+    if [ "$effective" = "$our_hooks" ]; then
+        local existing_chain
+        if [ -f "$cfg" ]; then
+            existing_chain=$(jq -r '.chained_hooks_path // empty' "$cfg" 2>/dev/null)
+        fi
+        if [ -n "$existing_chain" ]; then
+            echo "✅ already installed (chain → $existing_chain)"
+            return 0
+        fi
+    fi
+
+    # Save original hooks path
+    if [ ! -f "$cfg" ]; then
+        echo "{}" > "$cfg"
+    fi
+    local tmp
+    tmp=$(mktemp)
+    jq --arg p "$original_hp" '.chained_hooks_path = $p' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+
+    # Switch local hooksPath to ours
+    (cd "$repo_root" && git config --local core.hooksPath "$our_hooks")
+
+    echo "✅ installed (chain mode)"
+    echo "   chained_hooks_path = $original_hp  (saved to .git/autoreviewer.json)"
+    echo "   local core.hooksPath = $our_hooks"
+    echo ""
+    echo "   Project hooks (commit-msg, pre-push, ...) still fire via _chain shim."
+    echo "   No tracked files in your repo were modified."
+    echo ""
+    echo "Test it:"
+    echo "  cd $repo_root && git commit --allow-empty -m 'test: autoreviewer'"
+}
+
+# Restore the original local hooksPath; remove chained_hooks_path entry.
+_ar_chain_uninstall() {
+    local repo_root="$1"
+    local git_dir cfg
+    git_dir=$(cd "$repo_root" && git rev-parse --absolute-git-dir)
+    cfg="$git_dir/autoreviewer.json"
+
+    local saved=""
+    if [ -f "$cfg" ]; then
+        saved=$(jq -r '.chained_hooks_path // empty' "$cfg" 2>/dev/null)
+    fi
+
+    if [ -z "$saved" ]; then
+        echo "ℹ️  No saved chained_hooks_path — nothing to restore here."
+        echo "   If this repo's effective hooksPath is autoreviewer's, manually run:"
+        echo "     git config --local --unset core.hooksPath"
+        return 0
+    fi
+
+    (cd "$repo_root" && git config --local core.hooksPath "$saved")
+    # Remove the key but keep the file (other autoreviewer settings may live there)
+    local tmp
+    tmp=$(mktemp)
+    jq 'del(.chained_hooks_path)' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+
+    echo "🧹 restored local core.hooksPath = $saved"
+    echo "   removed chained_hooks_path from .git/autoreviewer.json"
+}
+
+# Migrate from the old design (which wrote a shim into the override dir) to
+# the new chain design.
+_ar_chain_upgrade() {
+    local repo_root="$1"
+    local original_hp="$2"
+    local override_abs="$original_hp"
+    if [[ "$override_abs" != /* ]]; then
+        override_abs="$repo_root/$override_abs"
+    fi
+    local legacy_shim="$override_abs/post-commit"
+
+    echo "Upgrading repo to chain-mode autoreviewer install..."
+
+    # 1. If legacy shim exists, deal with it
+    if [ -f "$legacy_shim" ]; then
+        # Check if file is tracked in git — warn the user
+        local tracked=""
+        if (cd "$repo_root" && git ls-files --error-unmatch "$override_abs/post-commit" >/dev/null 2>&1); then
+            tracked="yes"
+        fi
+
+        # Backup
+        local bak="$legacy_shim.bak.$(date +%s)"
+        cp "$legacy_shim" "$bak"
+        echo "ℹ️  backed up legacy shim: $bak"
+
+        if grep -q "$AR_MARKER_BEGIN" "$legacy_shim" 2>/dev/null; then
+            # Marker-wrapped shim → strip block
+            local tmp
+            tmp=$(mktemp)
+            awk -v b="$AR_MARKER_BEGIN" -v e="$AR_MARKER_END" '
+                $0 == b { skip=1; next }
+                $0 == e { skip=0; next }
+                !skip
+            ' "$legacy_shim" > "$tmp"
+            awk 'NF{p=1} p' "$tmp" > "$legacy_shim"
+            rm -f "$tmp"
+        elif grep -q "\.autoreviewer/hooks/post-commit" "$legacy_shim" 2>/dev/null; then
+            # Legacy plain shim → strip the trigger lines
+            local tmp
+            tmp=$(mktemp)
+            awk '
+                /\.autoreviewer\/hooks\/post-commit/ { next }
+                /autoreviewer trigger \(managed by autoreviewer install\)/ { next }
+                { print }
+            ' "$legacy_shim" > "$tmp"
+            awk 'NF{p=1} p' "$tmp" > "$legacy_shim"
+            rm -f "$tmp"
+        fi
+
+        # If the file is now essentially empty (just shebang or empty), delete it
+        local non_blank
+        non_blank=$(grep -cv '^\s*$' "$legacy_shim" 2>/dev/null || echo 0)
+        if [ "$non_blank" -le 1 ] && head -1 "$legacy_shim" 2>/dev/null | grep -q '^#!'; then
+            rm -f "$legacy_shim"
+            echo "🧹 removed (was only autoreviewer trigger): $legacy_shim"
+        else
+            echo "🧹 removed autoreviewer trigger from: $legacy_shim"
+        fi
+
+        if [ "$tracked" = "yes" ]; then
+            echo ""
+            echo "⚠️  WARNING: $legacy_shim is TRACKED IN GIT."
+            echo "   The cleanup above only changed your working copy."
+            echo "   Please review with: git diff $legacy_shim"
+            echo "   …and commit the removal so other team members aren't affected."
+        fi
+    else
+        echo "ℹ️  no legacy shim file found at $legacy_shim — proceeding to chain install"
+    fi
+
+    # 2. Install in new chain mode
+    _ar_chain_install "$repo_root" "$original_hp"
+}
+
+# ---------- uninstall ----------
+
+cmd_uninstall() {
+    echo "Uninstalling autoreviewer..."
+    read -rp "This will remove $AUTOREVIEWER_HOME and unset the global git hooks path. Continue? [y/N] " yn
+    [ "$yn" = "y" ] || [ "$yn" = "Y" ] || { echo "Cancelled."; return 0; }
+
+    # Unset core.hooksPath only if it points to us
+    local current
+    current=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
+    if [ "$current" = "$AUTOREVIEWER_HOME/hooks" ] || [ "$current" = "$AUTOREVIEWER_HOME/hooks/" ]; then
+        git config --global --unset core.hooksPath
+        echo "  unset core.hooksPath"
+    elif [ -n "$current" ]; then
+        echo "  ⚠️  core.hooksPath is $current (not us); leaving alone"
+    fi
+
+    rm -rf "$AUTOREVIEWER_HOME"
+    rm -f "$HOME/.local/bin/autoreviewer"
+    rm -f "/usr/local/bin/autoreviewer"
+    echo "✅ Uninstalled. (Per-repo .git/reviews/ data is preserved.)"
+}
+
+# ---------- dispatch ----------
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    install)   cmd_install "$@" ;;
+    enable)    cmd_enable "$@" ;;
+    disable)   cmd_disable "$@" ;;
+    status)    cmd_status "$@" ;;
+    run)       cmd_run "$@" ;;
+    log)       cmd_log "$@" ;;
+    show)      cmd_show "$@" ;;
+    clean)     cmd_clean "$@" ;;
+    cancel)    cmd_cancel "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) die "unknown command: $cmd (try 'autoreviewer help')" ;;
+esac

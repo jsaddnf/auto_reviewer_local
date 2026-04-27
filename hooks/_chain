@@ -1,0 +1,48 @@
+#!/bin/bash
+# autoreviewer generic hook chain helper.
+#
+# Invoked by every shim under ~/.autoreviewer/hooks/ (commit-msg, pre-commit, ...).
+# Looks up the project's "original" hooks directory (saved in
+# <repo>/.git/autoreviewer.json as `chained_hooks_path`), and execs the
+# corresponding hook there. Falls back to <repo>/.git/hooks/<name> if no
+# chained path is set.
+#
+# Usage: _chain <hook-name> [args...]
+
+set -u
+
+HOOK_NAME="${1:-}"
+[ -z "$HOOK_NAME" ] && exit 0
+shift
+
+# Fast exit if not in a git repo
+REPO_GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0
+
+CFG="$REPO_GIT_DIR/autoreviewer.json"
+CHAINED=""
+if [ -f "$CFG" ] && command -v jq >/dev/null 2>&1; then
+    CHAINED=$(jq -r '.chained_hooks_path // empty' "$CFG" 2>/dev/null)
+fi
+
+# 1. Try chained hooks dir (Husky / Lefthook / project .githooks)
+if [ -n "$CHAINED" ]; then
+    if [[ "$CHAINED" != /* ]]; then
+        REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || REPO_ROOT=""
+        if [ -n "$REPO_ROOT" ]; then
+            CHAINED="$REPO_ROOT/$CHAINED"
+        fi
+    fi
+    CHAINED_HOOK="$CHAINED/$HOOK_NAME"
+    if [ -x "$CHAINED_HOOK" ]; then
+        exec "$CHAINED_HOOK" "$@"
+    fi
+fi
+
+# 2. Fallback: <repo>/.git/hooks/<name> (the default git hooks dir)
+LEGACY_HOOK="$REPO_GIT_DIR/hooks/$HOOK_NAME"
+if [ -x "$LEGACY_HOOK" ] && [ "$LEGACY_HOOK" != "$0" ]; then
+    exec "$LEGACY_HOOK" "$@"
+fi
+
+# 3. No chained hook found — exit 0 so the commit/push/etc. proceeds
+exit 0

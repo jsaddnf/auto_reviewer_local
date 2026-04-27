@@ -1,0 +1,54 @@
+#!/bin/bash
+# autoreviewer global post-commit hook
+#
+# This hook is invoked by git when core.hooksPath points to autoreviewer's
+# hooks directory. It does two things:
+#   1. Optionally triggers an async background review via runner.py
+#   2. Delegates to the repo's local .git/hooks/post-commit (if any),
+#      so we never break user-defined hooks.
+
+set -u
+
+AUTOREVIEWER_HOME="${AUTOREVIEWER_HOME:-$HOME/.autoreviewer}"
+
+# Source config helpers (silent fail if missing -> just chain to local hook)
+if [ -f "$AUTOREVIEWER_HOME/lib/config.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$AUTOREVIEWER_HOME/lib/config.sh"
+fi
+
+# Find the repo we're in. Use --absolute-git-dir to always get an absolute
+# path (git 2.13+); fall back to manual resolution if needed.
+REPO_GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null) \
+    || REPO_GIT_DIR=$(cd "$(git rev-parse --git-dir 2>/dev/null)" 2>/dev/null && pwd) \
+    || exit 0
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+# Trigger autoreviewer (only if enabled and runner exists)
+if command -v ar_is_enabled >/dev/null 2>&1 && ar_is_enabled "$REPO_ROOT"; then
+    if [ -f "$AUTOREVIEWER_HOME/lib/runner.py" ]; then
+        # Resolve commit hash now (HEAD is the just-made commit)
+        COMMIT=$(git rev-parse HEAD 2>/dev/null)
+        if [ -n "$COMMIT" ]; then
+            # Detached background process:
+            # - nohup so it survives the parent shell exiting
+            # - all I/O redirected to a log file (not /dev/null, so we can debug)
+            # - disown removes from job table
+            LOG_DIR="$REPO_GIT_DIR/reviews"
+            mkdir -p "$LOG_DIR"
+            LOG_FILE="$LOG_DIR/.last-run.log"
+            (
+                cd "$REPO_ROOT" || exit 0
+                nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$COMMIT" \
+                    > "$LOG_FILE" 2>&1 &
+                disown
+            )
+        fi
+    fi
+fi
+
+# === Chain to project's original post-commit (if any) via _chain helper ===
+# _chain handles two cases:
+#   1. Husky / Lefthook / .githooks (saved as chained_hooks_path)
+#   2. Legacy <repo>/.git/hooks/post-commit
+exec "$AUTOREVIEWER_HOME/hooks/_chain" post-commit "$@"
