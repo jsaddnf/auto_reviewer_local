@@ -63,67 +63,6 @@ Per-repo opt-in is:
 - **Reversible** — `autoreviewer install --uninstall` restores the original state cleanly
 - **Cheap** — one command per repo, only for repos you actually want reviewed
 
-## How it works
-
-**Zero modification to any tracked file in your project.** All install state
-lives under `<repo>/.git/` (which is local to your machine, never committed).
-
-`autoreviewer install` does one of two things based on the current repo:
-
-### Vanilla repo (no local `core.hooksPath`)
-
-```
-git config --local core.hooksPath ~/.autoreviewer/hooks
-```
-
-Git for this repo will use our shared hook directory.
-
-### Repo overrides `core.hooksPath` (Husky / Lefthook / project `.githooks/`)
-
-This is "chain mode":
-
-```
-1. Save the project's current hooksPath (e.g. ".husky") into:
-     <repo>/.git/autoreviewer.json   ← under .git/, NOT tracked
-2. Override local core.hooksPath to ~/.autoreviewer/hooks/
-3. Our hook directory contains shims for every standard git hook
-   (commit-msg, pre-commit, pre-push, ...). Each shim runs _chain,
-   which exec's the project's original hook from the saved path.
-4. post-commit shim ALSO triggers an autoreviewer review first.
-```
-
-Result: your team's `commit-msg`, `pre-push`, etc. all still fire normally.
-Plus you get a review on every commit. Other team members are completely
-unaffected — they don't even see any new files in `git status`.
-
-### On commit, regardless of mode
-
-```
-git commit (CLI / GUI / IDE — any client)
-      │
-      ▼
-~/.autoreviewer/hooks/post-commit
-      │
-      ├─→ background: python3 runner.py HEAD
-      │       ├─→ claude -p   (full prompt + diff fed via stdin)
-      │       ├─→ parse JSON, write .git/reviews/<date>_<hash>.{json,md}
-      │       ├─→ update index.json
-      │       └─→ terminal-notifier (clickable → open .md)
-      │
-      └─→ exec _chain post-commit "$@"
-              ├─→ chained_hooks_path/post-commit (Husky/Lefthook case)
-              └─→ <repo>/.git/hooks/post-commit (vanilla fallback)
-
-# For OTHER hook types (commit-msg etc), git invokes our shim directly:
-git commit-msg "$1"
-      │
-      ▼
-~/.autoreviewer/hooks/commit-msg
-      │
-      └─→ exec _chain commit-msg "$@"
-              └─→ <chained-path>/commit-msg or <repo>/.git/hooks/commit-msg
-```
-
 ## Install
 
 ### Prerequisites
@@ -434,12 +373,66 @@ git config --global --unset core.hooksPath
 autoreviewer install
 ```
 
-## Not yet implemented (future)
+## How it works
 
-- `autoreviewer scan PATH` — bulk-install across all repos under a directory
-- CI mode (`autoreviewer run --ci` for pipelines)
-- `git notes` integration so reviews can be pushed to remote
-- Web dashboard from `index.json`
+**Zero modification to any tracked file in your project.** All install state
+lives under `<repo>/.git/` (which is local to your machine, never committed).
+
+`autoreviewer install` does one of two things based on the current repo:
+
+### Vanilla repo (no local `core.hooksPath`)
+
+```
+git config --local core.hooksPath ~/.autoreviewer/hooks
+```
+
+Git for this repo will use our shared hook directory.
+
+### Repo overrides `core.hooksPath` (Husky / Lefthook / project `.githooks/`)
+
+This is "chain mode":
+
+```
+1. Save the project's current hooksPath (e.g. ".husky") into:
+     <repo>/.git/autoreviewer.json   ← under .git/, NOT tracked
+2. Override local core.hooksPath to ~/.autoreviewer/hooks/
+3. Our hook directory contains shims for every standard git hook
+   (commit-msg, pre-commit, pre-push, ...). Each shim runs _chain,
+   which exec's the project's original hook from the saved path.
+4. post-commit shim ALSO triggers an autoreviewer review first.
+```
+
+Result: your team's `commit-msg`, `pre-push`, etc. all still fire normally.
+Plus you get a review on every commit. Other team members are completely
+unaffected — they don't even see any new files in `git status`.
+
+### On commit, regardless of mode
+
+```
+git commit (CLI / GUI / IDE — any client)
+      │
+      ▼
+~/.autoreviewer/hooks/post-commit
+      │
+      ├─→ background: python3 runner.py HEAD
+      │       ├─→ claude -p   (full prompt + diff fed via stdin)
+      │       ├─→ parse JSON, write .git/reviews/<date>_<hash>.{json,md}
+      │       ├─→ update index.json
+      │       └─→ terminal-notifier (clickable → open .md)
+      │
+      └─→ exec _chain post-commit "$@"
+              ├─→ chained_hooks_path/post-commit (Husky/Lefthook case)
+              └─→ <repo>/.git/hooks/post-commit (vanilla fallback)
+
+# For OTHER hook types (commit-msg etc), git invokes our shim directly:
+git commit-msg "$1"
+      │
+      ▼
+~/.autoreviewer/hooks/commit-msg
+      │
+      └─→ exec _chain commit-msg "$@"
+              └─→ <chained-path>/commit-msg or <repo>/.git/hooks/commit-msg
+```
 
 ## License
 

@@ -61,66 +61,6 @@ git 在设计上就把 hooks 配置交给每个仓库自己管理。很多项目
 - **可逆**：`autoreviewer install --uninstall` 能干净地还原
 - **轻量**：每个仓库一条命令，只在你真正想 review 的项目里启用
 
-## 工作原理
-
-**绝不修改你项目的任何被追踪文件**。所有安装状态都放在 `<repo>/.git/` 下，
-这部分是本地的、不会被提交。
-
-`autoreviewer install` 会根据当前仓库自动选择两种模式之一：
-
-### 普通仓库（没设置过 `core.hooksPath`）
-
-```
-git config --local core.hooksPath ~/.autoreviewer/hooks
-```
-
-把这个仓库的 hooks 路径指向我们的共享 hook 目录。
-
-### 仓库已经覆盖了 `core.hooksPath`（Husky / Lefthook / 项目 `.githooks/`）
-
-进入「链式模式（chain mode）」：
-
-```
-1. 把项目原本的 hooksPath（如 ".husky"）保存到：
-     <repo>/.git/autoreviewer.json   ← 在 .git/ 下，不会被追踪
-2. 把本地 core.hooksPath 改为 ~/.autoreviewer/hooks/
-3. 我们的 hooks 目录里为每个标准 git hook 都生成了一个 shim
-   （commit-msg、pre-commit、pre-push 等）。每个 shim 都会调用
-   _chain，由它再去执行项目原本路径下的同名 hook。
-4. post-commit 的 shim 还会先触发一次 autoreviewer 评审。
-```
-
-效果：你团队的 `commit-msg`、`pre-push` 等 hook 一切正常，外加每次提交都
-有一份 review。其他同事毫无感知——他们 `git status` 里看不到任何新文件。
-
-### 提交时的执行链路（不论哪种模式）
-
-```
-git commit（命令行 / 图形客户端 / IDE，任何方式）
-      │
-      ▼
-~/.autoreviewer/hooks/post-commit
-      │
-      ├─→ 后台：python3 runner.py HEAD
-      │       ├─→ claude -p   （完整 prompt + diff 经 stdin 传入）
-      │       ├─→ 解析 JSON，写入 .git/reviews/<日期>_<hash>.{json,md}
-      │       ├─→ 更新 index.json
-      │       └─→ terminal-notifier 弹通知（点击即打开 .md）
-      │
-      └─→ exec _chain post-commit "$@"
-              ├─→ chained_hooks_path/post-commit （Husky / Lefthook 场景）
-              └─→ <repo>/.git/hooks/post-commit  （普通场景兜底）
-
-# 其他 hook（如 commit-msg）由 git 直接调到我们的 shim：
-git commit-msg "$1"
-      │
-      ▼
-~/.autoreviewer/hooks/commit-msg
-      │
-      └─→ exec _chain commit-msg "$@"
-              └─→ <chained-path>/commit-msg 或 <repo>/.git/hooks/commit-msg
-```
-
 ## 安装
 
 ### 前置依赖
@@ -423,12 +363,65 @@ git config --global --unset core.hooksPath
 autoreviewer install
 ```
 
-## 暂未实现（后续计划）
+## 工作原理
 
-- `autoreviewer scan PATH` —— 在某个目录下批量给所有仓库装上
-- CI 模式（`autoreviewer run --ci`，给流水线用）
-- `git notes` 集成，把评审推到远端
-- 基于 `index.json` 的网页 dashboard
+**绝不修改你项目的任何被追踪文件**。所有安装状态都放在 `<repo>/.git/` 下，
+这部分是本地的、不会被提交。
+
+`autoreviewer install` 会根据当前仓库自动选择两种模式之一：
+
+### 普通仓库（没设置过 `core.hooksPath`）
+
+```
+git config --local core.hooksPath ~/.autoreviewer/hooks
+```
+
+把这个仓库的 hooks 路径指向我们的共享 hook 目录。
+
+### 仓库已经覆盖了 `core.hooksPath`（Husky / Lefthook / 项目 `.githooks/`）
+
+进入「链式模式（chain mode）」：
+
+```
+1. 把项目原本的 hooksPath（如 ".husky"）保存到：
+     <repo>/.git/autoreviewer.json   ← 在 .git/ 下，不会被追踪
+2. 把本地 core.hooksPath 改为 ~/.autoreviewer/hooks/
+3. 我们的 hooks 目录里为每个标准 git hook 都生成了一个 shim
+   （commit-msg、pre-commit、pre-push 等）。每个 shim 都会调用
+   _chain，由它再去执行项目原本路径下的同名 hook。
+4. post-commit 的 shim 还会先触发一次 autoreviewer 评审。
+```
+
+效果：你团队的 `commit-msg`、`pre-push` 等 hook 一切正常，外加每次提交都
+有一份 review。其他同事毫无感知——他们 `git status` 里看不到任何新文件。
+
+### 提交时的执行链路（不论哪种模式）
+
+```
+git commit（命令行 / 图形客户端 / IDE，任何方式）
+      │
+      ▼
+~/.autoreviewer/hooks/post-commit
+      │
+      ├─→ 后台：python3 runner.py HEAD
+      │       ├─→ claude -p   （完整 prompt + diff 经 stdin 传入）
+      │       ├─→ 解析 JSON，写入 .git/reviews/<日期>_<hash>.{json,md}
+      │       ├─→ 更新 index.json
+      │       └─→ terminal-notifier 弹通知（点击即打开 .md）
+      │
+      └─→ exec _chain post-commit "$@"
+              ├─→ chained_hooks_path/post-commit （Husky / Lefthook 场景）
+              └─→ <repo>/.git/hooks/post-commit  （普通场景兜底）
+
+# 其他 hook（如 commit-msg）由 git 直接调到我们的 shim：
+git commit-msg "$1"
+      │
+      ▼
+~/.autoreviewer/hooks/commit-msg
+      │
+      └─→ exec _chain commit-msg "$@"
+              └─→ <chained-path>/commit-msg 或 <repo>/.git/hooks/commit-msg
+```
 
 ## License
 
