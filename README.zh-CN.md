@@ -9,7 +9,11 @@
 
 ```bash
 # 1. 安装工具本体（每台机器一次）
-./install.sh
+git clone https://github.com/jsaddnf/auto_reviewer_local.git ~/.autoreviewer-src
+~/.autoreviewer-src/install.sh
+
+# 1b. 之后随时升级
+autoreviewer update                  # 拉最新源码 + 重新安装
 
 # 2. 按仓库分别开启
 cd /path/to/your/repo
@@ -18,11 +22,13 @@ autoreviewer install
 # 3. 之后该仓库每次提交都会触发后台评审
 git commit -m "feat: add login"
 # → 提交立刻返回，不阻塞
+# → 提交瞬间就弹一条「开始评审」通知
 # → Claude Code 在后台跑 review
-# → 完成后弹出 macOS 通知，点击直接打开报告
+# → 评审结束后再弹一条带严重级别 + 点击即打开的通知
 
 # 其他常用命令
 autoreviewer status                  # 查看当前仓库的安装状态
+autoreviewer update                  # 拉最新源码 + 重新安装
 autoreviewer run                     # 手动同步执行一次 review
 autoreviewer log                     # 浏览历史
 autoreviewer show a3f8c21            # 查看某次评审
@@ -130,17 +136,35 @@ git commit-msg "$1"
 ### 安装工具本体
 
 ```bash
-git clone https://github.com/jsaddnf/auto_reviewer_local.git autoreviewer
-cd autoreviewer
-./install.sh
+git clone https://github.com/jsaddnf/auto_reviewer_local.git ~/.autoreviewer-src
+~/.autoreviewer-src/install.sh
 ```
+
+（路径只是约定——你想克隆到哪儿都行；`install.sh` 会把自己所在目录写到
+`~/.autoreviewer/config.json` 的 `source_dir` 字段，`autoreviewer update`
+会读回来用。）
 
 安装脚本会：
 
 1. 检查依赖；如果缺失会询问是否 `brew install jq terminal-notifier`
 2. 把文件安装到 `~/.autoreviewer/`
 3. 把 `autoreviewer` CLI 安装到 `~/.local/bin/`
-4. **不会动你的 git 配置** —— 我们走的是按仓库开启的方式
+4. 把源码克隆位置记录下来，方便日后 `autoreviewer update`
+5. **不会动你的 git 配置** —— 我们走的是按仓库开启的方式
+
+### 升级工具本体
+
+```bash
+autoreviewer update
+```
+
+它会在记录的 `source_dir` 里跑 `git pull --ff-only`，然后帮你重新跑一次
+`install.sh --force`。`--no-pull` 表示跳过 pull，仅基于当前磁盘上的代码重装
+（在你自己改 autoreviewer 时方便）。
+
+升级会保留你的 `~/.autoreviewer/config.json`：只重写 `source_dir` 字段，新版本
+引入的新字段（`notify_start`、`language` 等）会用默认值补齐。**不会覆盖你已经
+设过的值**（包括字面量 `false`）。各仓库的安装状态也保留。
 
 ### 给某个仓库开启评审
 
@@ -187,6 +211,7 @@ autoreviewer install [--repo PATH] [--uninstall|--upgrade]
 autoreviewer enable [--repo PATH]            恢复评审（disable 的反操作）
 autoreviewer disable [--repo PATH]           暂停评审（不卸载）
 autoreviewer status                          显示安装状态、开关、计数
+autoreviewer update [--no-pull]              拉最新源码 + 重新安装工具本体
 autoreviewer run [<commit>] [options]        手动触发一次评审
                                                --async       后台运行
                                                --no-notify   不发通知
@@ -224,9 +249,12 @@ autoreviewer 用 `install --uninstall`。
   "prompt_file": "~/.autoreviewer/prompts/default.txt",
   "notification": "terminal-notifier",
   "notify_threshold": "low",
+  "notify_start": true,
+  "language": "zh",
   "auto_open": "on_high",
   "timeout_seconds": 180,
-  "disabled_repos": []
+  "disabled_repos": [],
+  "source_dir": "/path/where/repo/was/cloned"
 }
 ```
 
@@ -237,10 +265,13 @@ autoreviewer 用 `install --uninstall`。
 | `command_args` | string[] | 追加给命令的参数。默认 `["-p"]`（Claude Code 的非交互模式） |
 | `prompt_file` | path | 评审 prompt 模板路径 |
 | `notification` | `terminal-notifier` / `osascript` / `none` | 通知方式 |
-| `notify_threshold` | `ok` / `low` / `medium` / `high` | 低于此严重级别不发通知 |
+| `notify_threshold` | `ok` / `low` / `medium` / `high` | 低于此严重级别不发**完成**通知 |
+| `notify_start` | `true` / `false` | hook 触发评审时是否弹「开始评审」通知（默认 `true`）。这条通知由 hook 在 fork python 之前用 shell 同步发出，避免 Python 启动延迟 |
+| `language` | `zh` / `en` | 评审输出语言**和** .md / 通知文案的语言（默认 `zh`）。表头元数据（Commit / Author / Date / ...）在两种语言下都保持英文 |
 | `auto_open` | `true` / `false` / `on_high` | 完成后是否自动打开 .md |
 | `timeout_seconds` | number | 评审超时秒数。Claude Code 评小提交一般 30–60s 完成，diff 大请适当调高 |
 | `disabled_repos` | string[] | 被排除的仓库绝对路径列表 |
+| `source_dir` | path | 工具源码 repo 的克隆位置（`autoreviewer update` 用），由 `install.sh` 自动设置 |
 
 ### 单仓库：`<repo>/.git/autoreviewer.json`
 
@@ -266,8 +297,21 @@ autoreviewer 用 `install --uninstall`。
 └── .last-run.log                      # 上一次后台跑的 stderr
 ```
 
-Markdown 里包含：总结、严重级别、问题清单（带 file:line）、影响范围分析
-（修改的文件 + 受影响的调用方）、改进建议。
+Markdown 里包含：
+
+- **总结** + 整体严重级别徽章
+- **问题清单** —— 带 `file:line` 的具体问题，每条带级别 + 修复建议
+- **影响范围** —— 修改的文件、**修改的调用栈**（diff 触及的函数 / 方法 / 类，
+  带 `kind` + `change` 标签）、**可能受影响的调用方**（带调用者符号名 + 影响
+  说明）、**行为/逻辑变化**（线程 / 契约 / 默认值等不绑定到单一符号的变化）、
+  风险等级
+- **测试建议** —— 具体的 `unit` / `integration` / `regression` / `manual`
+  用例，每条带 `why` 解释为什么这条测试值得加
+- **改进建议** —— 与具体问题无关的整体改进点
+
+如果模型输出无法解析，runner 会先尝试本地修复 JSON（基于栈的括号自动补全），
+再尝试让模型自己修复一次；如果都失败，**仍然会写一份降级 .md**（含原始输出
+预览），保证通知和 `--open` 始终能落到一个文件上 —— 详见下方常见问题。
 
 ## 与已有 hook 的兼容性
 
@@ -342,10 +386,26 @@ autoreviewer install --upgrade
 `-execute` 选项，原生 `osascript` 不支持。
 
 **日志里看到 JSON 解析失败。**
-runner 会把原始输出存到 `<reviews>/<...>.raw.txt`，方便排查。多半是模型在
-JSON 前后多说了一句话——可以收紧 prompt，或者把 `command_args` 改成
-`["-p", "--output-format", "json"]`，让 Claude Code 把回复包装成结构化
-信封（解析器会自动拆包）。
+runner 在放弃之前有三层兜底：
+
+1. `extract_json` 依次尝试：直接 parse → 拆 wrapper → 剥 markdown 围栏 →
+   贪心地从首个 `{` 到末个 `}` → 基于栈的括号修复（能自动补齐被截断的
+   `}` / `]`，且字符串感知不会误补转义里的字符）。
+2. 上述都失败时，runner 会另起一轮便宜的对话，**让模型自己修复刚才的
+   坏 JSON**（不带 diff，纯结构修复）。
+3. 修复也失败时，**仍然会写一份降级 .md**，里面有每一阶段的错误提示 +
+   原始输出前 5000 字预览，保证「点击通知打开 .md」的链路不断。
+
+不论走到哪一步，模型的原始输出始终会被存到 `<reviews>/<...>.raw.txt`。
+
+**不想看到「开始评审」通知。**
+在 `~/.autoreviewer/config.json`（或某个仓库的
+`<repo>/.git/autoreviewer.json`）里设 `"notify_start": false`。
+完成通知不受影响，照常按 `notify_threshold` 触发。
+
+**想要英文输出。**
+任一份 config 里设 `"language": "en"`，会同时切换模型评审文本 + 渲染 .md /
+通知文案。表头元数据（Commit / Author / Date / ...）两种语言下都保持英文。
 
 **评审卡住了。**
 `autoreviewer cancel`（或者直接 `kill $(cat .git/reviews/.running.pid)`）。

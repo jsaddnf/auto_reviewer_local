@@ -9,7 +9,11 @@
 
 ```bash
 # 1. Install the tool itself (once per machine)
-./install.sh
+git clone https://github.com/jsaddnf/auto_reviewer_local.git ~/.autoreviewer-src
+~/.autoreviewer-src/install.sh
+
+# 1b. Update later (any time)
+autoreviewer update                  # pulls origin + reinstalls
 
 # 2. Opt in repos individually
 cd /path/to/your/repo
@@ -18,11 +22,13 @@ autoreviewer install
 # 3. From now on, every commit in this repo triggers a background review
 git commit -m "feat: add login"
 # → commit returns immediately
+# → instant "review started" notification pops on commit
 # → review runs in the background, driven by Claude Code
-# → macOS notification pops with severity + click-to-open
+# → second notification with severity + click-to-open when done
 
 # Other useful commands
 autoreviewer status                  # see install state for current repo
+autoreviewer update                  # pull latest source + reinstall
 autoreviewer run                     # manual sync review
 autoreviewer log                     # browse history
 autoreviewer show a3f8c21            # view one
@@ -133,17 +139,37 @@ git commit-msg "$1"
 ### Install the tool
 
 ```bash
-git clone https://github.com/jsaddnf/auto_reviewer_local.git autoreviewer
-cd autoreviewer
-./install.sh
+git clone https://github.com/jsaddnf/auto_reviewer_local.git ~/.autoreviewer-src
+~/.autoreviewer-src/install.sh
 ```
+
+(Path is just a convention — clone wherever you like; `install.sh` records its
+own location in `~/.autoreviewer/config.json` as `source_dir`, and `autoreviewer
+update` reads it back from there.)
 
 The installer:
 
 1. Checks dependencies; offers to `brew install jq terminal-notifier` if missing
 2. Installs files to `~/.autoreviewer/`
 3. Installs the `autoreviewer` CLI to `~/.local/bin/`
-4. **Does NOT touch git config** — per-repo opt-in is the canonical path
+4. Records the source clone path so `autoreviewer update` works
+5. **Does NOT touch git config** — per-repo opt-in is the canonical path
+
+### Update the tool
+
+```bash
+autoreviewer update
+```
+
+That's it. It runs `git pull --ff-only` in the recorded `source_dir`, then
+re-runs `install.sh --force` for you. Use `--no-pull` to rebuild from local
+edits without pulling (useful when you're working on autoreviewer itself).
+
+Your `~/.autoreviewer/config.json` is preserved across updates — only
+`source_dir` is rewritten, and any new fields introduced by a newer version
+(`notify_start`, `language`, ...) are added with defaults if missing. **Existing
+user values are never overwritten** (including literal `false`). Per-repo
+install state is also preserved.
 
 ### Opt a repo in
 
@@ -193,6 +219,7 @@ autoreviewer install [--repo PATH] [--uninstall|--upgrade]
 autoreviewer enable [--repo PATH]            Resume reviews (counterpart to disable)
 autoreviewer disable [--repo PATH]           Pause reviews without uninstalling
 autoreviewer status                          Show install state + on/off + counts
+autoreviewer update [--no-pull]              Pull latest source + reinstall the tool
 autoreviewer run [<commit>] [options]        Manually trigger a review
                                                --async       run in background
                                                --no-notify   skip notification
@@ -230,9 +257,12 @@ Use `disable` for short pauses (e.g., a series of WIP commits). Use
   "prompt_file": "~/.autoreviewer/prompts/default.txt",
   "notification": "terminal-notifier",
   "notify_threshold": "low",
+  "notify_start": true,
+  "language": "zh",
   "auto_open": "on_high",
   "timeout_seconds": 180,
-  "disabled_repos": []
+  "disabled_repos": [],
+  "source_dir": "/path/where/repo/was/cloned"
 }
 ```
 
@@ -243,10 +273,13 @@ Use `disable` for short pauses (e.g., a series of WIP commits). Use
 | `command_args` | string[] | Extra args appended to the command. Default `["-p"]` (Claude Code's non-interactive print mode) |
 | `prompt_file` | path | Review prompt template |
 | `notification` | `terminal-notifier`/`osascript`/`none` | Notification mode |
-| `notify_threshold` | `ok`/`low`/`medium`/`high` | Skip notifications below this severity |
+| `notify_threshold` | `ok`/`low`/`medium`/`high` | Skip the **completion** notification below this severity |
+| `notify_start` | `true`/`false` | Pop a "review started" notification when a hook triggers a review (default `true`). The hook fires this synchronously via shell to avoid Python boot lag |
+| `language` | `zh`/`en` | Output language for the model's review **and** the rendered .md/notifications (default `zh`). Header metadata (Commit/Author/Date/...) stays English in both |
 | `auto_open` | `true`/`false`/`on_high` | Auto-open the .md when review completes |
 | `timeout_seconds` | number | Review timeout. Claude Code finishes small commits in 30–60s; raise for big diffs |
 | `disabled_repos` | string[] | Absolute paths to exclude |
+| `source_dir` | path | Where this tool's source repo is checked out (used by `autoreviewer update`). Set automatically by `install.sh` |
 
 ### Per-repo: `<repo>/.git/autoreviewer.json`
 
@@ -272,8 +305,19 @@ Each review writes two files plus an index:
 └── .last-run.log                      # stderr of the last background run
 ```
 
-The Markdown contains: summary, severity, issue list (with file:line), impact
-analysis (modified files + affected callers), and improvement suggestions.
+The Markdown contains:
+
+- **Summary** + overall severity badge
+- **Issues** — concrete bugs at `file:line`, each with severity and a fix idea
+- **Impact** — modified files, **modified call stack** (functions/methods/classes the diff touches, with `kind` + `change` tags), **affected callers** (with the caller's symbol name and how the change ripples), **behavioral / logic changes** (contract / threading / default-value shifts not tied to a single symbol), and a risk level
+- **Test suggestions** — concrete `unit` / `integration` / `regression` / `manual` cases the author should add, with a `why` justifying each
+- **General suggestions** — improvements unrelated to a specific issue
+
+If model output can't be parsed, the runner attempts JSON repair locally
+(bracket-stack auto-completion) and then via a second LLM call. If all attempts
+fail, a degraded `<...>.md` is still written (with the raw output preview) so
+notifications and `--open` always land somewhere — see the troubleshooting
+entry below.
 
 ## Compatibility with existing hooks
 
@@ -350,10 +394,28 @@ Verify `terminal-notifier --help` works. If missing,
 `-execute` flag which native `osascript` doesn't support.
 
 **JSON parse failure in the log.**
-The runner saves the raw output to `<reviews>/<...>.raw.txt` for debugging.
-The model occasionally adds a sentence before the JSON — tighten the prompt
-or set `command_args` to `["-p", "--output-format", "json"]` so Claude Code
-wraps the response in a structured envelope (the parser unwraps it).
+The runner has three layers of defense before giving up:
+
+1. `extract_json` tries direct parse → wrapper unwrap → markdown fence strip →
+   greedy first-`{` to last-`}` → string-aware bracket-stack repair (which
+   auto-appends missing `}` / `]` for truncated outputs).
+2. If all of those fail, the runner asks the model to repair its own malformed
+   output in a fresh, cheap call (no diff included — pure structural fix).
+3. If repair also fails, a degraded `<...>.md` report is still written with
+   per-stage error notes and a 5000-char preview of the raw output, so the
+   click-to-open notification still lands somewhere.
+
+The original raw model output is always at `<reviews>/<...>.raw.txt`.
+
+**Don't want the "review started" notification.**
+Set `"notify_start": false` in `~/.autoreviewer/config.json` (or in the
+per-repo `<repo>/.git/autoreviewer.json` to scope to a single repo). The
+completion notification still fires, gated by `notify_threshold`.
+
+**Want the review output in English instead of Chinese.**
+Set `"language": "en"` in either config file. This switches both the model's
+review text and the rendered .md / notification labels. Header metadata
+(Commit / Author / Date / ...) stays English in either mode.
 
 **A review is stuck.**
 `autoreviewer cancel` (or `kill $(cat .git/reviews/.running.pid)`).

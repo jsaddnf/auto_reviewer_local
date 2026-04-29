@@ -176,12 +176,30 @@ if [ ! -f "$AUTOREVIEWER_HOME/config.json" ]; then
   "prompt_file": "$AUTOREVIEWER_HOME/prompts/default.txt",
   "notification": "terminal-notifier",
   "notify_threshold": "low",
+  "notify_start": true,
+  "language": "zh",
   "auto_open": "on_high",
   "timeout_seconds": 180,
-  "disabled_repos": []
+  "disabled_repos": [],
+  "source_dir": "$SCRIPT_DIR"
 }
 EOF
     echo "  ✅ created config.json"
+else
+    # Always refresh source_dir so 'autoreviewer update' knows where to pull.
+    # Also fill in any new fields introduced after the user's first install
+    # — using `has()` not `//=`, because `//=` treats `false` as missing and
+    # would silently flip a user's `notify_start: false` back to true.
+    if command -v jq >/dev/null 2>&1; then
+        tmp=$(mktemp)
+        jq --arg s "$SCRIPT_DIR" '
+            .source_dir = $s
+            | (if has("notify_start") then . else .notify_start = true end)
+            | (if has("language")     then . else .language     = "zh" end)
+        ' "$AUTOREVIEWER_HOME/config.json" > "$tmp" \
+            && mv "$tmp" "$AUTOREVIEWER_HOME/config.json"
+        echo "  ✅ updated source_dir + ensured new fields in config.json"
+    fi
 fi
 
 # ---------- 5. install CLI executable ----------
@@ -214,6 +232,9 @@ fi
 echo ""
 echo "🎉 autoreviewer tool installed!"
 echo ""
+echo "Source recorded at: $SCRIPT_DIR"
+echo "→ Next time, just run 'autoreviewer update' to pull the latest."
+echo ""
 echo "Per-repo model (recommended): you opt repos in one at a time."
 echo ""
 echo "Next steps:"
@@ -225,6 +246,7 @@ echo "Then 'git commit' in that repo will trigger a background review and pop a"
 echo "clickable macOS notification when done."
 echo ""
 echo "Other commands:"
+echo "  autoreviewer update               # pull latest source + reinstall"
 echo "  autoreviewer install --uninstall  # opt this repo out"
 echo "  autoreviewer disable              # global pause (without uninstalling)"
 echo "  AUTOREVIEWER_SKIP=1 git commit    # skip review for a single commit"

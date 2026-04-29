@@ -24,7 +24,9 @@ ar_config_get() {
             fi
             local repo_config="$abs_git_dir/autoreviewer.json"
             if [ -f "$repo_config" ]; then
-                value=$(jq -r --arg k "$key" '.[$k] // empty' "$repo_config" 2>/dev/null)
+                # Use has()/if-then to be false-aware: `// empty` would
+                # collapse a literal `false` into "missing".
+                value=$(jq -r --arg k "$key" 'if has($k) then .[$k] else empty end' "$repo_config" 2>/dev/null)
                 if [ -n "$value" ]; then
                     echo "$value"
                     return 0
@@ -34,7 +36,7 @@ ar_config_get() {
     fi
 
     if [ -f "$GLOBAL_CONFIG" ]; then
-        jq -r --arg k "$key" '.[$k] // empty' "$GLOBAL_CONFIG" 2>/dev/null
+        jq -r --arg k "$key" 'if has($k) then .[$k] else empty end' "$GLOBAL_CONFIG" 2>/dev/null
     fi
 }
 

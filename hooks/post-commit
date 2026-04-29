@@ -30,6 +30,43 @@ if command -v ar_is_enabled >/dev/null 2>&1 && ar_is_enabled "$REPO_ROOT"; then
         # Resolve commit hash now (HEAD is the just-made commit)
         COMMIT=$(git rev-parse HEAD 2>/dev/null)
         if [ -n "$COMMIT" ]; then
+            # --- "review started" notification (instant, before fork) ---
+            # Configurable via notify_start in config.json (default: true).
+            # This is shell-side instead of Python-side so the user sees it
+            # immediately on commit return — Python startup adds 1–2s otherwise.
+            notify_start_cfg=""
+            if command -v ar_config_get >/dev/null 2>&1; then
+                notify_start_cfg=$(ar_config_get notify_start "$REPO_ROOT" 2>/dev/null)
+            fi
+            notify_start_cfg="${notify_start_cfg:-true}"
+            if [ "$notify_start_cfg" = "true" ] && command -v terminal-notifier >/dev/null 2>&1; then
+                SHORT_HASH=$(git rev-parse --short HEAD 2>/dev/null)
+                SUBJECT=$(git log -1 --format=%s HEAD 2>/dev/null)
+                # Truncate subject to 75 chars; hash + " · " adds ~12 → ~87 total
+                SUBJECT_TRUNC="${SUBJECT:0:75}"
+                # repo basename — disambiguates notifications when multiple
+                # repos have autoreviewer enabled. Mirrors runner.py's format.
+                REPO_NAME="${REPO_ROOT##*/}"
+                # Localize the started message to match runner.py's labels.
+                # Default is zh; keep keys in sync with LABELS in runner.py.
+                lang=""
+                if command -v ar_config_get >/dev/null 2>&1; then
+                    lang=$(ar_config_get language "$REPO_ROOT" 2>/dev/null)
+                fi
+                lang="${lang:-zh}"
+                if [ "$lang" = "en" ]; then
+                    started_msg="⏳ Running review in background"
+                else
+                    started_msg="⏳ 后台审核中"
+                fi
+                terminal-notifier \
+                    -title "autoreviewer · $REPO_NAME" \
+                    -subtitle "$SHORT_HASH · $SUBJECT_TRUNC" \
+                    -message "$started_msg" \
+                    >/dev/null 2>&1 &
+                disown 2>/dev/null || true
+            fi
+
             # Detached background process:
             # - nohup so it survives the parent shell exiting
             # - all I/O redirected to a log file (not /dev/null, so we can debug)
@@ -37,9 +74,13 @@ if command -v ar_is_enabled >/dev/null 2>&1 && ar_is_enabled "$REPO_ROOT"; then
             LOG_DIR="$REPO_GIT_DIR/reviews"
             mkdir -p "$LOG_DIR"
             LOG_FILE="$LOG_DIR/.last-run.log"
+            # We pass --no-start-notify because the shell block above already
+            # fired a "STARTED" terminal-notifier ~1-2s before Python booted.
+            # Without this flag runner.py would fire a duplicate notification.
             (
                 cd "$REPO_ROOT" || exit 0
                 nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$COMMIT" \
+                    --no-start-notify \
                     > "$LOG_FILE" 2>&1 &
                 disown
             )

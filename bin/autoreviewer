@@ -5,6 +5,7 @@
 #   enable [--repo PATH]      enable globally or for a specific repo
 #   disable [--repo PATH]     disable globally or for a specific repo
 #   status                    show current state
+#   update [--no-pull]        pull latest source and reinstall the tool
 #   run [<commit>] [opts]     manually trigger a review (default: HEAD, sync)
 #   log [-n N] [--severity X] list recent reviews
 #   show [<hash>] [--open]    show a specific review
@@ -45,6 +46,8 @@ COMMANDS
   enable [--repo PATH]            Enable autoreviewer (globally or for a repo)
   disable [--repo PATH]           Disable autoreviewer (globally or for a repo)
   status                          Show current state and config
+  update [--no-pull]              Pull latest source and re-run install.sh
+                                    --no-pull   Skip git pull, just rebuild
   run [<commit>] [options]        Manually trigger a review
                                     --async       run in background
                                     --no-notify   skip notification
@@ -231,8 +234,11 @@ cmd_run() {
         esac
     done
 
+    # Note: ${extra[@]+"${extra[@]}"} is the bash 3.x-safe form. macOS ships
+    # bash 3.2.57 where `"${extra[@]}"` on an empty array trips `set -u` with
+    # 'unbound variable'. Fixed in bash 4.4 but Apple won't ship that.
     if [ "$mode" = "--sync" ]; then
-        python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" --sync "${extra[@]}"
+        python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" --sync ${extra[@]+"${extra[@]}"}
     else
         # Async: detach
         local repo_root
@@ -241,7 +247,7 @@ cmd_run() {
         mkdir -p "$(dirname "$log_file")"
         (
             cd "$repo_root" || exit 1
-            nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" "${extra[@]}" \
+            nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" ${extra[@]+"${extra[@]}"} \
                 > "$log_file" 2>&1 &
             disown
         )
@@ -676,6 +682,75 @@ _ar_chain_upgrade() {
     _ar_chain_install "$repo_root" "$original_hp"
 }
 
+# ---------- update (self-update the tool) ----------
+
+cmd_update() {
+    local no_pull=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-pull) no_pull=1; shift ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: autoreviewer update [--no-pull]
+
+Pulls the latest autoreviewer source from origin and re-runs install.sh.
+
+  --no-pull    Skip 'git pull' — just re-run install.sh against the
+               source as it is on disk now (useful for local dev).
+
+The source location is whatever directory install.sh was last run from.
+It's stored in ~/.autoreviewer/config.json under the "source_dir" field.
+EOF
+                return 0 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    if [ ! -f "$GLOBAL_CONFIG" ]; then
+        die "no $GLOBAL_CONFIG — re-run install.sh from a clone first"
+    fi
+
+    local src
+    src=$(jq -r '.source_dir // empty' "$GLOBAL_CONFIG" 2>/dev/null)
+    if [ -z "$src" ]; then
+        echo "❌ source_dir not set in $GLOBAL_CONFIG" >&2
+        echo "   This usually means autoreviewer was installed before the" >&2
+        echo "   update mechanism existed. To fix, run install.sh from a clone:" >&2
+        echo "" >&2
+        echo "     git clone https://github.com/jsaddnf/auto_reviewer_local.git \\" >&2
+        echo "         ~/.autoreviewer-src" >&2
+        echo "     ~/.autoreviewer-src/install.sh --force" >&2
+        exit 1
+    fi
+    if [ ! -d "$src" ]; then
+        echo "❌ recorded source_dir does not exist: $src" >&2
+        echo "   Re-clone and re-run install.sh." >&2
+        exit 1
+    fi
+    if [ ! -x "$src/install.sh" ]; then
+        echo "❌ $src/install.sh missing or not executable" >&2
+        exit 1
+    fi
+
+    if [ "$no_pull" = "0" ]; then
+        if [ -d "$src/.git" ]; then
+            echo "📥 Pulling latest in $src ..."
+            if ! git -C "$src" pull --ff-only; then
+                echo "" >&2
+                echo "❌ git pull failed (uncommitted changes? non-ff?)." >&2
+                echo "   Resolve at $src, then run again." >&2
+                echo "   Or: autoreviewer update --no-pull (rebuild current source)" >&2
+                exit 1
+            fi
+        else
+            echo "ℹ️  $src is not a git checkout — skipping pull, just rebuilding."
+        fi
+    fi
+
+    echo "🔄 Re-running install.sh ..."
+    "$src/install.sh" --force
+}
+
 # ---------- uninstall ----------
 
 cmd_uninstall() {
@@ -709,6 +784,7 @@ case "$cmd" in
     enable)    cmd_enable "$@" ;;
     disable)   cmd_disable "$@" ;;
     status)    cmd_status "$@" ;;
+    update)    cmd_update "$@" ;;
     run)       cmd_run "$@" ;;
     log)       cmd_log "$@" ;;
     show)      cmd_show "$@" ;;
