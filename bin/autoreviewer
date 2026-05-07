@@ -58,6 +58,13 @@ COMMANDS
                                     --json        print raw JSON
   clean --all | --older-than 30d  Clean up review files in current repo
   cancel                          Kill the currently running review
+  heal                            Re-apply chain mode if core.hooksPath was
+                                    overwritten (no-op when healthy). Used
+                                    by the shell prompt hook.
+  shell-hook <install|uninstall|status>
+                                  Manage the precmd/PROMPT_COMMAND snippet
+                                    in your ~/.zshrc or ~/.bashrc that runs
+                                    'heal' automatically after every command.
   uninstall                       Uninstall autoreviewer entirely
   help                            Show this help
 
@@ -137,6 +144,11 @@ cmd_status() {
         echo "Master switch: OFF 🛑 (autoreviewer enable to resume)"
     fi
 
+    # Shell prompt hook — runs 'autoreviewer heal' after every command in
+    # interactive shells. Covers any tool that overwrites core.hooksPath
+    # (pod install, npm install, husky install, etc.).
+    echo "Shell hook:   $(_ar_shell_hook_status_line)"
+
     # Legacy global hook check — still report if user has it from old install
     local global_hp
     global_hp=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
@@ -195,6 +207,17 @@ cmd_status() {
             echo "    Found old-style shim: $legacy"
             echo "    Recommended: autoreviewer install --upgrade"
             echo "      (chain mode keeps your project's tracked files clean)"
+        elif [ -n "$chained" ]; then
+            # We were chain-installed before (chained_hooks_path saved), but
+            # something overwrote core.hooksPath. Almost always `pod install`
+            # on iOS repos. Self-heal would normally have fixed this already
+            # — if we reach here it's because AUTOREVIEWER_NO_AUTOHEAL=1 or
+            # the heal failed.
+            echo "  install state: OVERWRITTEN ⚠️ (was installed, hooksPath got reset)"
+            echo "    Saved chain: $chained"
+            echo "    Current hooksPath: $effective_abs"
+            echo "    Likely cause: \`pod install\` (or another tool) reset core.hooksPath."
+            echo "    Fix: autoreviewer install   (re-applies chain mode)"
         else
             echo "  install state: NOT installed ⚠️"
             echo "    This repo's hooksPath = $effective_abs"
@@ -412,17 +435,23 @@ cmd_cancel() {
 AR_MARKER_BEGIN="# >>> autoreviewer trigger >>>"
 AR_MARKER_END="# <<< autoreviewer trigger <<<"
 
+# Marker for the shell prompt hook block written into ~/.zshrc / ~/.bashrc
+AR_SHELL_HOOK_BEGIN="# >>> autoreviewer prompt hook >>>"
+AR_SHELL_HOOK_END="# <<< autoreviewer prompt hook <<<"
+
 cmd_install() {
     local repo=""
     local uninstall=0
     local upgrade=0
+    local no_shell_hook=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --repo) repo="$2"; shift 2 ;;
             --uninstall) uninstall=1; shift ;;
             --upgrade) upgrade=1; shift ;;
+            --no-shell-hook) no_shell_hook=1; shift ;;
             -h|--help)
-                echo "Usage: autoreviewer install [--repo PATH] [--uninstall|--upgrade]"
+                echo "Usage: autoreviewer install [--repo PATH] [--uninstall|--upgrade] [--no-shell-hook]"
                 echo ""
                 echo "Enables autoreviewer for one git repo (the canonical workflow)."
                 echo ""
@@ -430,9 +459,15 @@ cmd_install() {
                 echo "  1. Vanilla repo (no local core.hooksPath):"
                 echo "       sets local core.hooksPath = ~/.autoreviewer/hooks"
                 echo "  2. Repo overrides core.hooksPath (Husky / Lefthook / project .githooks):"
-                echo "       installs a small shim into that directory's post-commit"
+                echo "       saves chained_hooks_path to .git/autoreviewer.json (chain mode)"
                 echo ""
-                echo "--uninstall reverses the change (cleanly, by case)."
+                echo "Also installs a shell prompt hook (~/.zshrc or ~/.bashrc) so that"
+                echo "core.hooksPath is auto-restored after any tool overwrites it"
+                echo "(pod install, npm install, etc.). Use --no-shell-hook to skip."
+                echo ""
+                echo "--uninstall reverses the per-repo change. Shell hook is left in"
+                echo "place (it benefits other repos); remove with"
+                echo "'autoreviewer shell-hook uninstall'."
                 return 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -501,6 +536,9 @@ cmd_install() {
         fi
 
         _ar_chain_install "$repo_root" "$original_hp"
+        if [ "$no_shell_hook" != "1" ]; then
+            _ar_shell_hook_install
+        fi
         return 0
     fi
 
@@ -508,6 +546,7 @@ cmd_install() {
     if [ "$uninstall" = "1" ]; then
         if [ "$effective_abs" = "$our_hooks_norm" ] && [ -n "$local_hp" ]; then
             git config --local --unset core.hooksPath
+            ar_repo_unregister "$repo_root"
             echo "🧹 unset local core.hooksPath (autoreviewer disabled for this repo)"
         else
             echo "ℹ️  Nothing to remove — repo isn't using our local hooksPath."
@@ -517,13 +556,21 @@ cmd_install() {
 
     if [ "$effective_abs" = "$our_hooks_norm" ]; then
         echo "✅ already installed (local core.hooksPath → $our_hooks)"
+        ar_repo_register "$repo_root"   # idempotent backfill
+        if [ "$no_shell_hook" != "1" ]; then
+            _ar_shell_hook_install
+        fi
         return 0
     fi
 
     # Set it
     git config --local core.hooksPath "$our_hooks"
+    ar_repo_register "$repo_root"
     echo "✅ installed for repo: $repo_root"
     echo "   set local core.hooksPath = $our_hooks"
+    if [ "$no_shell_hook" != "1" ]; then
+        _ar_shell_hook_install
+    fi
     echo ""
     echo "Test it:"
     echo "  git commit --allow-empty -m 'test: autoreviewer'"
@@ -552,6 +599,7 @@ _ar_chain_install() {
         fi
         if [ -n "$existing_chain" ]; then
             echo "✅ already installed (chain → $existing_chain)"
+            ar_repo_register "$repo_root"   # idempotent; backfills registry
             return 0
         fi
     fi
@@ -566,6 +614,9 @@ _ar_chain_install() {
 
     # Switch local hooksPath to ours
     (cd "$repo_root" && git config --local core.hooksPath "$our_hooks")
+
+    # Register in the prompt-hook fast-path registry
+    ar_repo_register "$repo_root"
 
     echo "✅ installed (chain mode)"
     echo "   chained_hooks_path = $original_hp  (saved to .git/autoreviewer.json)"
@@ -602,6 +653,9 @@ _ar_chain_uninstall() {
     local tmp
     tmp=$(mktemp)
     jq 'del(.chained_hooks_path)' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+
+    # Drop from the prompt-hook fast-path registry
+    ar_repo_unregister "$repo_root"
 
     echo "🧹 restored local core.hooksPath = $saved"
     echo "   removed chained_hooks_path from .git/autoreviewer.json"
@@ -682,6 +736,234 @@ _ar_chain_upgrade() {
     _ar_chain_install "$repo_root" "$original_hp"
 }
 
+# ---------- heal (idempotent self-fix; called by shell prompt hook) ----------
+
+cmd_heal() {
+    if command -v ar_self_heal_if_needed >/dev/null 2>&1; then
+        ar_self_heal_if_needed
+    fi
+}
+
+# ---------- shell prompt hook ----------
+# Writes a precmd_functions (zsh) or PROMPT_COMMAND (bash) snippet that runs
+# `autoreviewer heal` after every command — but ONLY when $PWD is inside a
+# repo registered in ~/.autoreviewer/repos. The registry check is pure
+# shell (no fork), so prompts outside any registered repo cost ~1ms.
+#
+# We install in BOTH ~/.zshrc and ~/.bash_profile/.bashrc (whichever
+# exist) so multi-shell users get coverage regardless of $SHELL.
+
+# Print the primary rc file (the one matching $SHELL). Used only to tell
+# users which file to source after install. Returns 1 for unknown shells.
+_ar_shell_primary_rc() {
+    case "${SHELL##*/}" in
+        zsh)  echo "$HOME/.zshrc" ;;
+        bash)
+            if [ -f "$HOME/.bash_profile" ]; then
+                echo "$HOME/.bash_profile"
+            else
+                echo "$HOME/.bashrc"
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Emit the shell hook block for the given shell kind (zsh|bash) on stdout.
+# Uses 'EOF' (quoted) heredoc so nothing inside is expanded — the snippet
+# is written to the rc file verbatim and only evaluated when the shell
+# starts. Markers go through echo so the script doesn't have to manually
+# escape $vars in the body.
+_ar_shell_hook_block() {
+    local kind="$1"
+    echo "$AR_SHELL_HOOK_BEGIN"
+    case "$kind" in
+        zsh)
+            cat <<'EOF'
+# Auto-heal git core.hooksPath after every command, but only when in a
+# registered autoreviewer repo. Pure-shell registry check first — if PWD
+# is not inside any registered repo, return immediately without forking.
+# Covers any tool that overrides core.hooksPath (pod install, npm install,
+# husky install, gradle, manual 'git config' edits).
+# Remove with: autoreviewer shell-hook uninstall
+__autoreviewer_precmd() {
+    local registry="${AUTOREVIEWER_HOME:-$HOME/.autoreviewer}/repos"
+    [[ -f "$registry" ]] || return
+    local r
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        case "$PWD" in
+            "$r"|"$r"/*)
+                command -v autoreviewer >/dev/null 2>&1 && autoreviewer heal 2>/dev/null
+                return
+                ;;
+        esac
+    done < "$registry"
+}
+typeset -g -a precmd_functions
+[[ -z ${precmd_functions[(r)__autoreviewer_precmd]:-} ]] && precmd_functions+=(__autoreviewer_precmd)
+EOF
+            ;;
+        bash)
+            cat <<'EOF'
+# Auto-heal git core.hooksPath after every command. Same fast-path
+# strategy as the zsh equivalent — see comments there.
+# Remove with: autoreviewer shell-hook uninstall
+__autoreviewer_precmd() {
+    local registry="${AUTOREVIEWER_HOME:-$HOME/.autoreviewer}/repos"
+    [ -f "$registry" ] || return 0
+    local r
+    while IFS= read -r r; do
+        [ -z "$r" ] && continue
+        case "$PWD" in
+            "$r"|"$r"/*)
+                command -v autoreviewer >/dev/null 2>&1 && autoreviewer heal 2>/dev/null
+                return 0
+                ;;
+        esac
+    done < "$registry"
+}
+case ";${PROMPT_COMMAND:-};" in
+    *";__autoreviewer_precmd;"*) ;;
+    *) PROMPT_COMMAND="__autoreviewer_precmd;${PROMPT_COMMAND:-}" ;;
+esac
+EOF
+            ;;
+    esac
+    echo "$AR_SHELL_HOOK_END"
+}
+
+# Return the list of rc files we want to write to: ~/.zshrc and one of
+# {~/.bash_profile, ~/.bashrc}. Skips files for shells the user clearly
+# doesn't have (rc file doesn't exist) UNLESS it's the primary rc for
+# the user's $SHELL — in that case we'll create it.
+_ar_shell_target_rcs() {
+    local primary
+    primary=$(_ar_shell_primary_rc 2>/dev/null) || primary=""
+
+    # zsh
+    if [ -f "$HOME/.zshrc" ] || [ "$primary" = "$HOME/.zshrc" ]; then
+        echo "$HOME/.zshrc"
+    fi
+    # bash — prefer .bash_profile if it exists, else .bashrc
+    if [ -f "$HOME/.bash_profile" ]; then
+        echo "$HOME/.bash_profile"
+    elif [ -f "$HOME/.bashrc" ] || [ "$primary" = "$HOME/.bashrc" ] || [ "$primary" = "$HOME/.bash_profile" ]; then
+        echo "$HOME/.bashrc"
+    fi
+}
+
+# Idempotent install across all relevant rc files.
+_ar_shell_hook_install() {
+    local primary
+    if ! primary=$(_ar_shell_primary_rc); then
+        echo "⚠️  shell hook: unknown shell ($SHELL); skipped" >&2
+        echo "   Manual install: append the hook block to your shell rc." >&2
+        return 0
+    fi
+
+    [ -f "$primary" ] || touch "$primary"
+
+    local installed=0
+    local rc
+    while IFS= read -r rc; do
+        [ -z "$rc" ] && continue
+        # File already has our marker → skip
+        if grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+            continue
+        fi
+        # Pick block flavor based on filename
+        local kind
+        case "$rc" in
+            *.zshrc) kind=zsh ;;
+            *.bash_profile|*.bashrc) kind=bash ;;
+            *) continue ;;
+        esac
+        {
+            echo ""
+            _ar_shell_hook_block "$kind"
+        } >> "$rc"
+        echo "✅ added prompt hook to $rc"
+        installed=$((installed + 1))
+    done < <(_ar_shell_target_rcs)
+
+    if [ "$installed" -gt 0 ]; then
+        echo "   activate now: source $primary   (or open a new terminal)"
+    fi
+}
+
+# Remove the marker block from every rc file that has one.
+_ar_shell_hook_uninstall() {
+    local removed=0
+    local rc
+    for rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+        [ -f "$rc" ] || continue
+        if ! grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+            continue
+        fi
+        local tmp
+        tmp=$(mktemp) || continue
+        awk -v b="$AR_SHELL_HOOK_BEGIN" -v e="$AR_SHELL_HOOK_END" '
+            $0 == b { skip=1; next }
+            $0 == e { skip=0; next }
+            !skip
+        ' "$rc" > "$tmp" && mv "$tmp" "$rc"
+        echo "🧹 removed prompt hook from $rc"
+        removed=$((removed + 1))
+    done
+    if [ "$removed" -eq 0 ]; then
+        echo "ℹ️  prompt hook not present in any shell rc — nothing to remove."
+    else
+        echo "   open a new terminal (or restart your shell) to fully apply"
+    fi
+}
+
+_ar_shell_hook_status_line() {
+    local found=""
+    local rc
+    for rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+        if [ -f "$rc" ] && grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+            if [ -z "$found" ]; then
+                found="$rc"
+            else
+                found="$found, $rc"
+            fi
+        fi
+    done
+    if [ -z "$found" ]; then
+        local primary
+        primary=$(_ar_shell_primary_rc 2>/dev/null) || primary="(unknown shell: $SHELL)"
+        echo "not installed (target: $primary)"
+    else
+        echo "installed in $found ✅"
+    fi
+}
+
+cmd_shell_hook() {
+    local sub="${1:-status}"
+    case "$sub" in
+        install)   _ar_shell_hook_install ;;
+        uninstall) _ar_shell_hook_uninstall ;;
+        status)
+            echo "Shell hook: $(_ar_shell_hook_status_line)"
+            ;;
+        -h|--help|help)
+            cat <<'EOF'
+Usage: autoreviewer shell-hook <install|uninstall|status>
+
+The shell hook adds a precmd_functions (zsh) or PROMPT_COMMAND (bash) entry
+to your shell rc that runs 'autoreviewer heal' after every command. Heal is
+a 3ms no-op when nothing is wrong; it self-fixes core.hooksPath when a tool
+(pod install / npm install / manual git config / etc.) has overwritten it.
+
+`autoreviewer install` calls 'shell-hook install' automatically the first
+time, unless --no-shell-hook is passed.
+EOF
+            ;;
+        *) die "unknown subcommand: $sub (try: install|uninstall|status)" ;;
+    esac
+}
+
 # ---------- update (self-update the tool) ----------
 
 cmd_update() {
@@ -755,7 +1037,7 @@ EOF
 
 cmd_uninstall() {
     echo "Uninstalling autoreviewer..."
-    read -rp "This will remove $AUTOREVIEWER_HOME and unset the global git hooks path. Continue? [y/N] " yn
+    read -rp "This will remove $AUTOREVIEWER_HOME, unset the global git hooks path, and remove the prompt hook from your shell rc. Continue? [y/N] " yn
     [ "$yn" = "y" ] || [ "$yn" = "Y" ] || { echo "Cancelled."; return 0; }
 
     # Unset core.hooksPath only if it points to us
@@ -768,6 +1050,11 @@ cmd_uninstall() {
         echo "  ⚠️  core.hooksPath is $current (not us); leaving alone"
     fi
 
+    # Remove shell rc hook BEFORE rm -rf so the helper functions are still
+    # in memory (they were sourced from lib/config.sh at script start, but
+    # the rc cleanup itself doesn't depend on the lib being on disk).
+    _ar_shell_hook_uninstall
+
     rm -rf "$AUTOREVIEWER_HOME"
     rm -f "$HOME/.local/bin/autoreviewer"
     rm -f "/usr/local/bin/autoreviewer"
@@ -778,6 +1065,18 @@ cmd_uninstall() {
 
 cmd="${1:-help}"
 shift 2>/dev/null || true
+
+# Self-heal opportunity for "read-style" commands: if this repo was chain-
+# installed before but something (typically `pod install`) overwrote
+# core.hooksPath, silently put it back. Skipped for explicit hooksPath ops
+# (install/uninstall) and for tool-level commands (update/help).
+case "$cmd" in
+    status|run|log|show|cancel|enable|disable)
+        if command -v ar_self_heal_if_needed >/dev/null 2>&1; then
+            ar_self_heal_if_needed
+        fi
+        ;;
+esac
 
 case "$cmd" in
     install)   cmd_install "$@" ;;
@@ -790,6 +1089,8 @@ case "$cmd" in
     show)      cmd_show "$@" ;;
     clean)     cmd_clean "$@" ;;
     cancel)    cmd_cancel "$@" ;;
+    heal)      cmd_heal "$@" ;;
+    shell-hook|shellhook) cmd_shell_hook "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     help|-h|--help) cmd_help ;;
     *) die "unknown command: $cmd (try 'autoreviewer help')" ;;
