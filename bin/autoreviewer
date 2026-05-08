@@ -48,7 +48,8 @@ COMMANDS
   status                          Show current state and config
   update [--no-pull]              Pull latest source and re-run install.sh
                                     --no-pull   Skip git pull, just rebuild
-  run [<commit>] [options]        Manually trigger a review
+  run [<commit>...] [options]     Manually trigger a review
+                                    --squash      review the span as ONE diff
                                     --async       run in background
                                     --no-notify   skip notification
                                     --open        open .md when done
@@ -65,6 +66,13 @@ COMMANDS
                                   Manage the precmd/PROMPT_COMMAND snippet
                                     in your ~/.zshrc or ~/.bashrc that runs
                                     'heal' automatically after every command.
+  path-hook <install|uninstall|status>
+                                  Manage the `export PATH=...` block that
+                                    makes the autoreviewer CLI findable
+                                    (~/.local/bin not on macOS default PATH).
+  config <get|set|unset|list> ... Read/write JSON config without hand-editing.
+                                    e.g. autoreviewer config set timeout_seconds 600
+                                    Use --repo PATH to edit per-repo override.
   uninstall                       Uninstall autoreviewer entirely
   help                            Show this help
 
@@ -148,6 +156,10 @@ cmd_status() {
     # interactive shells. Covers any tool that overwrites core.hooksPath
     # (pod install, npm install, husky install, etc.).
     echo "Shell hook:   $(_ar_shell_hook_status_line)"
+    # PATH hook — adds ~/.local/bin (or wherever the CLI lives) to PATH
+    # so `autoreviewer` is findable. macOS doesn't include ~/.local/bin
+    # by default.
+    echo "PATH hook:    $(_ar_path_hook_status_line)"
 
     # Legacy global hook check — still report if user has it from old install
     local global_hp
@@ -242,39 +254,184 @@ cmd_status() {
 
 cmd_run() {
     require_repo
-    local commit="HEAD"
     local mode="--sync"  # default sync for manual invocation
+    local squash=0
+    local args=()
     local extra=()
     while [ $# -gt 0 ]; do
         case "$1" in
-            --async) mode=""; shift ;;
-            --sync) mode="--sync"; shift ;;
+            --async)     mode=""; shift ;;
+            --sync)      mode="--sync"; shift ;;
+            --squash)    squash=1; shift ;;
             --no-notify) extra+=("--no-notify"); shift ;;
-            --open) extra+=("--open"); shift ;;
-            -h|--help) echo "Usage: autoreviewer run [<commit>] [--async|--sync] [--no-notify] [--open]"; return 0 ;;
+            --open)      extra+=("--open"); shift ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: autoreviewer run [<commit>...] [--squash] [--async|--sync] [--no-notify] [--open]
+
+  <commit>...   one or more commits or git rev-list specs.
+                  examples:  HEAD            (default if none given)
+                             abc123 def456   two specific commits
+                             HEAD~3..HEAD    range — last 3 commits
+                             main..feature   commits unique to feature
+                no args → defaults to HEAD.
+
+  --squash      review the entire span as ONE combined diff (PR-style).
+                base = oldest^, tip = newest. Single .md is produced.
+                Without --squash (default), each commit gets its own .md,
+                consistent with the post-commit hook.
+
+  --async       fire reviews in the background.
+  --sync        wait for each to finish (default for manual run).
+  --no-notify   suppress macOS notifications.
+  --open        open the .md report when done.
+EOF
+                return 0 ;;
             -*) die "unknown option: $1" ;;
-            *) commit="$1"; shift ;;
+            *)  args+=("$1"); shift ;;
         esac
     done
 
-    # Note: ${extra[@]+"${extra[@]}"} is the bash 3.x-safe form. macOS ships
-    # bash 3.2.57 where `"${extra[@]}"` on an empty array trips `set -u` with
-    # 'unbound variable'. Fixed in bash 4.4 but Apple won't ship that.
-    if [ "$mode" = "--sync" ]; then
-        python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" --sync ${extra[@]+"${extra[@]}"}
+    # No positional args → review HEAD only (matches old behavior).
+    if [ "${#args[@]}" -eq 0 ]; then
+        args=("HEAD")
+    fi
+
+    # Resolve every arg to one or more commit hashes:
+    #   - 'a..b' / 'a...b' / 'a^!' → expand via git rev-list
+    #   - single ref (HEAD, branch, hash, tag) → resolve via git rev-parse
+    # Result `resolved` is in user-given order; for ranges, oldest first.
+    local resolved=()
+    local arg
+    for arg in "${args[@]}"; do
+        if [[ "$arg" == *..* ]] || [[ "$arg" == *^@ ]] || [[ "$arg" == *^! ]]; then
+            # Range / set spec — expand
+            local h
+            local got=0
+            while IFS= read -r h; do
+                [ -n "$h" ] && resolved+=("$h") && got=1
+            done < <(git rev-list --reverse "$arg" 2>/dev/null)
+            [ "$got" = "0" ] && die "no commits matched: $arg"
+        else
+            local h
+            h=$(git rev-parse --verify "$arg" 2>/dev/null) \
+                || die "unknown commit: $arg"
+            resolved+=("$h")
+        fi
+    done
+
+    if [ "${#resolved[@]}" -eq 0 ]; then
+        die "no commits to review (resolved list is empty)"
+    fi
+
+    local repo_root
+    repo_root=$(git rev-parse --show-toplevel)
+    local reviews_dir="$repo_root/.git/reviews"
+    mkdir -p "$reviews_dir"
+
+    if [ "$squash" = "1" ]; then
+        # Squash: build ONE range covering oldest..newest and send to runner.py.
+        # Two subtleties:
+        #   1. User may pass commits out of order; sort by commit date so
+        #      "oldest" is genuinely the oldest in the input set.
+        #   2. If the oldest commit is a root commit (no parent), `oldest^`
+        #      doesn't resolve. Fall back to the well-known empty-tree SHA
+        #      (4b825dc...4904) so we still diff from "before history".
+        #
+        # Note on sort order: `--no-walk=sorted` sorts by COMMIT DATE
+        # (newest first); `--reverse` flips to oldest first. This is NOT
+        # topological order — for our use it's fine because oldest/newest
+        # in a feature branch typically agree, but rebase/cherry-pick can
+        # decouple them. If that becomes a problem, switch to
+        # `--topo-order` (note: --no-walk + --topo-order is rejected by
+        # git; you'd have to drop --no-walk and rely on input being a
+        # range).
+        local sorted=()
+        local h
+        while IFS= read -r h; do
+            [ -n "$h" ] && sorted+=("$h")
+        done < <(git rev-list --reverse --no-walk=sorted "${resolved[@]+${resolved[@]}}" 2>/dev/null)
+        if [ "${#sorted[@]}" -eq 0 ]; then
+            die "could not sort resolved commits"
+        fi
+        local last_idx=$((${#sorted[@]} - 1))
+        local oldest="${sorted[0]}"
+        local newest="${sorted[$last_idx]}"
+
+        local range base_full
+        if base_full=$(git rev-parse --verify "${oldest}^" 2>/dev/null); then
+            range="${base_full}..${newest}"
+        else
+            # Empty tree SHA — universally present in every git repo.
+            range="4b825dc642cb6eb9a060e54bf8d69288fbee4904..${newest}"
+        fi
+
+        local oldest_short newest_short
+        oldest_short=$(git rev-parse --short "$oldest")
+        newest_short=$(git rev-parse --short "$newest")
+        local log_file="$reviews_dir/.last-run-${oldest_short}_to_${newest_short}.log"
+        echo "🔄 squash review of ${#sorted[@]} commit(s): ${oldest_short} → ${newest_short}"
+        _autoreviewer_run_one "$range" "$mode" "$repo_root" "$log_file" "${extra[@]+${extra[@]}}"
+        if [ "$mode" != "--sync" ]; then
+            echo "   started in background (log: $log_file)"
+        fi
     else
-        # Async: detach
-        local repo_root
-        repo_root=$(git rev-parse --show-toplevel)
-        local log_file="$repo_root/.git/reviews/.last-run.log"
-        mkdir -p "$(dirname "$log_file")"
+        # Per-commit: run runner.py once per resolved commit, in order
+        # (oldest first). With async, we still serialize via runner.py's
+        # flock — but we kick them off immediately so the user sees one
+        # "started" message per commit.
+        local total=${#resolved[@]}
+        local i=1
+        local h
+        local async_logs=()
+        for h in "${resolved[@]}"; do
+            local short
+            short=$(git rev-parse --short "$h")
+            echo "🔄 [$i/$total] reviewing $short"
+            # Use a per-target log file so async fan-out doesn't truncate
+            # earlier runners' output (each `> "$log_file"` redirect on
+            # the same path would clobber the previous one).
+            local log_file="$reviews_dir/.last-run-${short}.log"
+            _autoreviewer_run_one "$h" "$mode" "$repo_root" "$log_file" "${extra[@]+${extra[@]}}"
+            [ "$mode" != "--sync" ] && async_logs+=("$log_file")
+            i=$((i + 1))
+        done
+        if [ "$mode" != "--sync" ]; then
+            echo "   $total review(s) queued in background. Logs:"
+            for h in "${async_logs[@]}"; do echo "     $h"; done
+        fi
+    fi
+}
+
+# Top-level helper (NOT nested inside cmd_run — bash functions are global,
+# nesting a function definition just delays its global registration to the
+# first time the outer is called and leaves it polluting the namespace
+# afterwards). Takes all dependencies via explicit params for testability.
+#
+# Usage:
+#   _autoreviewer_run_one <target> <mode> <repo_root> <log_file> [extra_args...]
+#
+# - target:    a commit hash, ref, or 'a..b' range to pass to runner.py
+# - mode:      "--sync" for foreground; anything else (incl. "") for async
+# - repo_root: absolute path to repo (cwd for the async subshell)
+# - log_file:  where to redirect stdout+stderr in async mode
+# - extra:     additional flags forwarded to runner.py (--no-notify, --open)
+_autoreviewer_run_one() {
+    local target="$1"
+    local mode="$2"
+    local repo_root="$3"
+    local log_file="$4"
+    shift 4
+
+    if [ "$mode" = "--sync" ]; then
+        python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$target" --sync "$@"
+    else
         (
             cd "$repo_root" || exit 1
-            nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$commit" ${extra[@]+"${extra[@]}"} \
+            nohup python3 "$AUTOREVIEWER_HOME/lib/runner.py" "$target" "$@" \
                 > "$log_file" 2>&1 &
             disown
         )
-        echo "🔄 review started in background (log: $log_file)"
     fi
 }
 
@@ -312,11 +469,13 @@ cmd_log() {
       | head -n "$n" \
       | while IFS='|' read -r hash date severity message issues; do
             local emoji
+            # Keep in sync with SEVERITY_EMOJI in lib/runner.py.
             case "$severity" in
-                high) emoji="🔴" ;;
-                medium|low) emoji="🟡" ;;
-                ok) emoji="🟢" ;;
-                *) emoji="⚪" ;;
+                high)   emoji="🔴" ;;
+                medium) emoji="🟠" ;;
+                low)    emoji="🟡" ;;
+                ok)     emoji="🟢" ;;
+                *)      emoji="⚪" ;;
             esac
             # Truncate ISO date to YYYY-MM-DD HH:MM
             date="${date:0:16}"
@@ -435,9 +594,31 @@ cmd_cancel() {
 AR_MARKER_BEGIN="# >>> autoreviewer trigger >>>"
 AR_MARKER_END="# <<< autoreviewer trigger <<<"
 
-# Marker for the shell prompt hook block written into ~/.zshrc / ~/.bashrc
-AR_SHELL_HOOK_BEGIN="# >>> autoreviewer prompt hook >>>"
-AR_SHELL_HOOK_END="# <<< autoreviewer prompt hook <<<"
+# Marker for the shell prompt hook block written into ~/.zshrc / ~/.bashrc.
+# Version is encoded in the marker so future block-body changes can be
+# detected and migrated. Bump AR_SHELL_HOOK_VERSION whenever the body
+# inside the hook block changes meaningfully.
+AR_SHELL_HOOK_VERSION="1"
+AR_SHELL_HOOK_BEGIN="# >>> autoreviewer prompt hook (v${AR_SHELL_HOOK_VERSION}) >>>"
+AR_SHELL_HOOK_END="# <<< autoreviewer prompt hook (v${AR_SHELL_HOOK_VERSION}) <<<"
+
+# Regex prefixes used to detect ANY version (including pre-versioned blocks
+# that lack the (vN) suffix). Used by install/uninstall/status so that:
+#   - install: doesn't write a duplicate when an older block already exists
+#   - uninstall: can clean up any historical version
+#   - status:   can warn when an older version is present
+AR_SHELL_HOOK_BEGIN_RE='^# >>> autoreviewer prompt hook'
+AR_SHELL_HOOK_END_RE='^# <<< autoreviewer prompt hook'
+
+# Marker for the PATH block written into ~/.zshrc / ~/.bashrc. Exists
+# because the CLI is installed under ~/.local/bin which is NOT on macOS
+# default PATH — without this block the user gets "command not found"
+# even though autoreviewer is correctly installed.
+AR_PATH_HOOK_VERSION="1"
+AR_PATH_HOOK_BEGIN="# >>> autoreviewer PATH (v${AR_PATH_HOOK_VERSION}) >>>"
+AR_PATH_HOOK_END="# <<< autoreviewer PATH (v${AR_PATH_HOOK_VERSION}) <<<"
+AR_PATH_HOOK_BEGIN_RE='^# >>> autoreviewer PATH'
+AR_PATH_HOOK_END_RE='^# <<< autoreviewer PATH'
 
 cmd_install() {
     local repo=""
@@ -837,6 +1018,11 @@ EOF
 # {~/.bash_profile, ~/.bashrc}. Skips files for shells the user clearly
 # doesn't have (rc file doesn't exist) UNLESS it's the primary rc for
 # the user's $SHELL — in that case we'll create it.
+#
+# install paths use this (smart subset). uninstall/status paths use
+# _ar_shell_all_known_rcs (full union) so we always clean up everything
+# we may have written historically — even if the smart-subset logic
+# changes later.
 _ar_shell_target_rcs() {
     local primary
     primary=$(_ar_shell_primary_rc 2>/dev/null) || primary=""
@@ -853,6 +1039,17 @@ _ar_shell_target_rcs() {
     fi
 }
 
+# Canonical full list of rc files we have EVER written to. Used by
+# uninstall and status_line in both shell-hook and path-hook so the
+# cleanup surface stays in sync as _ar_shell_target_rcs evolves.
+# Append-only — never remove entries from this list, only add (so a
+# user who upgraded across versions still gets cleaned up).
+_ar_shell_all_known_rcs() {
+    echo "$HOME/.zshrc"
+    echo "$HOME/.bash_profile"
+    echo "$HOME/.bashrc"
+}
+
 # Idempotent install across all relevant rc files.
 _ar_shell_hook_install() {
     local primary
@@ -865,11 +1062,21 @@ _ar_shell_hook_install() {
     [ -f "$primary" ] || touch "$primary"
 
     local installed=0
+    local outdated=0
+    local outdated_files=""
     local rc
     while IFS= read -r rc; do
         [ -z "$rc" ] && continue
-        # File already has our marker → skip
-        if grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+        # If file has any version of our marker, don't write again — that
+        # would create a duplicate block. If the marker is the CURRENT
+        # version, this is a no-op (idempotent install). If it's an older
+        # version, mark it for the end-of-loop summary so we print the
+        # upgrade hint exactly once even when multiple rcs are outdated.
+        if grep -qE -- "$AR_SHELL_HOOK_BEGIN_RE" "$rc" 2>/dev/null; then
+            if ! grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+                outdated=$((outdated + 1))
+                outdated_files="${outdated_files:+$outdated_files, }$rc"
+            fi
             continue
         fi
         # Pick block flavor based on filename
@@ -890,27 +1097,59 @@ _ar_shell_hook_install() {
     if [ "$installed" -gt 0 ]; then
         echo "   activate now: source $primary   (or open a new terminal)"
     fi
+    if [ "$outdated" -gt 0 ]; then
+        echo "ℹ️  older prompt hook block(s) detected in: $outdated_files"
+        echo "   To upgrade to v${AR_SHELL_HOOK_VERSION}, run:"
+        echo "     autoreviewer shell-hook uninstall && autoreviewer shell-hook install"
+    fi
 }
 
-# Remove the marker block from every rc file that has one.
+# Remove any version of our marker block from every rc file that has one.
+# Uses regex prefix match so that pre-versioned blocks (no (vN) suffix) are
+# also cleaned. The awk strips between matched BEGIN/END regex pairs.
+#
+# Walks _ar_shell_all_known_rcs (NOT _ar_shell_target_rcs) so cleanup
+# covers any historical write target even if install logic narrows.
 _ar_shell_hook_uninstall() {
     local removed=0
     local rc
-    for rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc"; do
+    while IFS= read -r rc; do
         [ -f "$rc" ] || continue
-        if ! grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+        if ! grep -qE -- "$AR_SHELL_HOOK_BEGIN_RE" "$rc" 2>/dev/null; then
+            continue
+        fi
+        # Sanity: count BEGINs and ENDs. If unbalanced, refuse to write —
+        # we don't want a stray BEGIN comment in the middle of the file
+        # to cause us to wipe everything after it.
+        #
+        # Note on `|| true`: grep -c prints "0" on no-match but exits 1.
+        # We use `|| true` (not `|| echo 0`) to avoid getting "0\n0" in
+        # the captured value, which would break the numeric comparison.
+        # Whitespace stripping is defensive against grep variants that
+        # might emit leading/trailing whitespace on -c output.
+        local begins ends
+        begins=$(grep -cE -- "$AR_SHELL_HOOK_BEGIN_RE" "$rc" 2>/dev/null || true)
+        ends=$(grep -cE -- "$AR_SHELL_HOOK_END_RE" "$rc" 2>/dev/null || true)
+        begins=${begins//[[:space:]]/}
+        ends=${ends//[[:space:]]/}
+        if [ "${begins:-0}" -ne "${ends:-0}" ]; then
+            echo "⚠️  $rc has ${begins:-0} BEGIN markers but ${ends:-0} END markers — refusing to edit." >&2
+            echo "   Please clean it up manually, then re-run this command." >&2
             continue
         fi
         local tmp
         tmp=$(mktemp) || continue
-        awk -v b="$AR_SHELL_HOOK_BEGIN" -v e="$AR_SHELL_HOOK_END" '
-            $0 == b { skip=1; next }
-            $0 == e { skip=0; next }
+        # Pass the regex prefixes via -v so the awk script and the shell
+        # constants stay in sync — bumping AR_SHELL_HOOK_BEGIN_RE doesn't
+        # require a parallel edit here.
+        awk -v b="$AR_SHELL_HOOK_BEGIN_RE" -v e="$AR_SHELL_HOOK_END_RE" '
+            $0 ~ b { skip=1; next }
+            $0 ~ e { skip=0; next }
             !skip
         ' "$rc" > "$tmp" && mv "$tmp" "$rc"
         echo "🧹 removed prompt hook from $rc"
         removed=$((removed + 1))
-    done
+    done < <(_ar_shell_all_known_rcs)
     if [ "$removed" -eq 0 ]; then
         echo "ℹ️  prompt hook not present in any shell rc — nothing to remove."
     else
@@ -919,23 +1158,26 @@ _ar_shell_hook_uninstall() {
 }
 
 _ar_shell_hook_status_line() {
-    local found=""
+    local current="" outdated=""
     local rc
-    for rc in "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc"; do
-        if [ -f "$rc" ] && grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
-            if [ -z "$found" ]; then
-                found="$rc"
-            else
-                found="$found, $rc"
-            fi
+    while IFS= read -r rc; do
+        [ -f "$rc" ] || continue
+        if grep -qF -- "$AR_SHELL_HOOK_BEGIN" "$rc" 2>/dev/null; then
+            current="${current:+$current, }$rc"
+        elif grep -qE -- "$AR_SHELL_HOOK_BEGIN_RE" "$rc" 2>/dev/null; then
+            outdated="${outdated:+$outdated, }$rc"
         fi
-    done
-    if [ -z "$found" ]; then
+    done < <(_ar_shell_all_known_rcs)
+    if [ -z "$current" ] && [ -z "$outdated" ]; then
         local primary
         primary=$(_ar_shell_primary_rc 2>/dev/null) || primary="(unknown shell: $SHELL)"
         echo "not installed (target: $primary)"
+    elif [ -n "$current" ] && [ -z "$outdated" ]; then
+        echo "installed in $current ✅ (v${AR_SHELL_HOOK_VERSION})"
+    elif [ -z "$current" ] && [ -n "$outdated" ]; then
+        echo "OUTDATED in $outdated ⚠️  (run: autoreviewer shell-hook uninstall && autoreviewer shell-hook install)"
     else
-        echo "installed in $found ✅"
+        echo "mixed ⚠️  current=$current, OUTDATED=$outdated (run: autoreviewer shell-hook uninstall && autoreviewer shell-hook install)"
     fi
 }
 
@@ -961,6 +1203,337 @@ time, unless --no-shell-hook is passed.
 EOF
             ;;
         *) die "unknown subcommand: $sub (try: install|uninstall|status)" ;;
+    esac
+}
+
+# ---------- PATH hook (ensure CLI is findable from interactive shells) ----------
+
+# Emit the PATH block on stdout. Argument: the absolute bin dir to add.
+# If bin_dir lives under $HOME, write it as "$HOME/relative/path" so the
+# block is portable across machines that share the same rc file.
+_ar_path_hook_block() {
+    local bin_dir="$1"
+    local rc_path="$bin_dir"
+    # Use case rather than `[ "${bin_dir#$HOME/}" != "$bin_dir" ]` so that
+    # $HOME with spaces or special chars doesn't break the prefix check.
+    case "$bin_dir" in
+        "$HOME"/*)
+            rc_path="\$HOME/${bin_dir#"$HOME"/}"
+            ;;
+    esac
+    echo "$AR_PATH_HOOK_BEGIN"
+    cat <<EOF
+# Added by 'autoreviewer install' so the autoreviewer CLI is findable in
+# interactive shells. The inner case-statement guards against double-add
+# (running this block twice does not duplicate the PATH entry).
+# Remove with: autoreviewer path-hook uninstall
+case ":\$PATH:" in
+    *":$rc_path:"*) ;;
+    *) export PATH="$rc_path:\$PATH" ;;
+esac
+EOF
+    echo "$AR_PATH_HOOK_END"
+}
+
+# Install the PATH block in all relevant shell rc files. Idempotent.
+# Argument: bin dir to add (defaults to $HOME/.local/bin).
+_ar_path_hook_install() {
+    local bin_dir="${1:-$HOME/.local/bin}"
+    local primary
+    primary=$(_ar_shell_primary_rc 2>/dev/null) || primary=""
+    [ -n "$primary" ] && [ ! -f "$primary" ] && touch "$primary"
+
+    local installed=0
+    local rc
+    while IFS= read -r rc; do
+        [ -z "$rc" ] && continue
+        if grep -qE -- "$AR_PATH_HOOK_BEGIN_RE" "$rc" 2>/dev/null; then
+            continue   # any version already present — leave it (idempotent)
+        fi
+        {
+            echo ""
+            _ar_path_hook_block "$bin_dir"
+        } >> "$rc"
+        echo "✅ added PATH entry to $rc"
+        installed=$((installed + 1))
+    done < <(_ar_shell_target_rcs)
+
+    if [ "$installed" -gt 0 ] && [ -n "$primary" ]; then
+        echo "   activate now: source $primary   (or open a new terminal)"
+    fi
+}
+
+# Remove the PATH block from every rc file that has one. Same balance-check
+# pattern as shell-hook uninstall, so a stray BEGIN comment can't cause us
+# to wipe everything below it.
+#
+# Walks _ar_shell_all_known_rcs to stay in lockstep with shell-hook uninstall
+# (rather than maintaining a parallel hardcoded list that could drift).
+_ar_path_hook_uninstall() {
+    local removed=0
+    local rc
+    while IFS= read -r rc; do
+        [ -f "$rc" ] || continue
+        if ! grep -qE -- "$AR_PATH_HOOK_BEGIN_RE" "$rc" 2>/dev/null; then
+            continue
+        fi
+        local begins ends
+        begins=$(grep -cE -- "$AR_PATH_HOOK_BEGIN_RE" "$rc" 2>/dev/null || true)
+        ends=$(grep -cE -- "$AR_PATH_HOOK_END_RE" "$rc" 2>/dev/null || true)
+        begins=${begins//[[:space:]]/}
+        ends=${ends//[[:space:]]/}
+        if [ "${begins:-0}" -ne "${ends:-0}" ]; then
+            echo "⚠️  $rc has ${begins:-0} PATH BEGIN markers but ${ends:-0} END markers — refusing to edit." >&2
+            continue
+        fi
+        local tmp
+        tmp=$(mktemp) || continue
+        awk -v b="$AR_PATH_HOOK_BEGIN_RE" -v e="$AR_PATH_HOOK_END_RE" '
+            $0 ~ b { skip=1; next }
+            $0 ~ e { skip=0; next }
+            !skip
+        ' "$rc" > "$tmp" && mv "$tmp" "$rc"
+        echo "🧹 removed PATH entry from $rc"
+        removed=$((removed + 1))
+    done < <(_ar_shell_all_known_rcs)
+}
+
+_ar_path_hook_status_line() {
+    local found=""
+    local rc
+    while IFS= read -r rc; do
+        if [ -f "$rc" ] && grep -qE -- "$AR_PATH_HOOK_BEGIN_RE" "$rc" 2>/dev/null; then
+            found="${found:+$found, }$rc"
+        fi
+    done < <(_ar_shell_all_known_rcs)
+    if [ -z "$found" ]; then
+        # Also check whether $BIN_DIR is currently in PATH — the block being
+        # absent doesn't necessarily mean PATH is broken (the user may have
+        # set it themselves elsewhere).
+        local bin_dir="${HOME}/.local/bin"
+        if echo "$PATH" | tr ':' '\n' | grep -qx "$bin_dir"; then
+            echo "not installed (but $bin_dir is already on PATH ✅)"
+        else
+            echo "not installed ⚠️  ($bin_dir is NOT on PATH — autoreviewer command may be unfindable)"
+        fi
+    else
+        echo "installed in $found ✅"
+    fi
+}
+
+cmd_path_hook() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        install)
+            local bin_dir="${1:-$HOME/.local/bin}"
+            _ar_path_hook_install "$bin_dir"
+            ;;
+        uninstall) _ar_path_hook_uninstall ;;
+        status)    echo "PATH hook: $(_ar_path_hook_status_line)" ;;
+        -h|--help|help)
+            cat <<'EOF'
+Usage: autoreviewer path-hook <install [bin_dir]|uninstall|status>
+
+Manages a small `export PATH=...` block in your ~/.zshrc / ~/.bashrc that
+adds the autoreviewer CLI directory to PATH. Idempotent — uses a marker
+block, so reinstall is a no-op. Removed automatically on
+'autoreviewer uninstall'.
+EOF
+            ;;
+        *) die "unknown subcommand: $sub (try: install|uninstall|status)" ;;
+    esac
+}
+
+# ---------- config (read/write JSON config without hand-editing) ----------
+
+# Resolve the target config file based on whether --repo was given.
+# Args: <repo_path_or_empty>
+# Stdout: absolute path to the JSON file (creating dirs as needed is the
+# caller's responsibility — this just resolves).
+# Side effect (subshell-safe): cd's into repo for git rev-parse, but only
+# inside this function's call so the caller's PWD is unaffected.
+_ar_config_target_file() {
+    local repo="$1"
+    if [ -n "$repo" ]; then
+        cd "$repo" 2>/dev/null || die "cannot cd to $repo"
+        local git_dir
+        git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) \
+            || die "not a git repository: $repo"
+        echo "$git_dir/autoreviewer.json"
+    else
+        echo "$GLOBAL_CONFIG"
+    fi
+}
+
+_ar_config_cmd_get() {
+    local key="" repo=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            -*) die "unknown option: $1" ;;
+            *) key="$1"; shift ;;
+        esac
+    done
+    [ -z "$key" ] && die "usage: autoreviewer config get <key> [--repo PATH]"
+
+    local file
+    file=$(_ar_config_target_file "$repo")
+    if [ ! -f "$file" ]; then
+        return 0   # silent for missing — caller can detect via empty stdout
+    fi
+    # Output the value as JSON-encoded (so numbers/bools come back faithfully).
+    # Strings get printed without quotes for shell-friendliness.
+    jq -r --arg k "$key" '
+        if has($k) then
+            (.[$k] | if type == "string" then . else tojson end)
+        else
+            empty
+        end
+    ' "$file"
+}
+
+_ar_config_cmd_set() {
+    local key="" value="" got_value=0 repo=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                if [ -z "$key" ]; then
+                    key="$1"
+                elif [ "$got_value" = "0" ]; then
+                    value="$1"
+                    got_value=1
+                else
+                    die "unexpected extra argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+    [ -z "$key" ] && die "usage: autoreviewer config set <key> <value> [--repo PATH]"
+    [ "$got_value" = "0" ] && die "usage: autoreviewer config set <key> <value> [--repo PATH]"
+
+    local file
+    file=$(_ar_config_target_file "$repo")
+    mkdir -p "$(dirname "$file")"
+    [ -f "$file" ] || echo "{}" > "$file"
+
+    local tmp
+    tmp=$(mktemp) || die "mktemp failed"
+
+    # Decide whether VALUE is a JSON literal (600, true, null, "x") or a
+    # bare string (claude). Use `jq empty` which only checks parse
+    # validity and ignores the value itself — `jq -e .` would falsely
+    # reject literal `false`/`null` because -e flags those as failure.
+    if printf '%s' "$value" | jq empty >/dev/null 2>&1; then
+        # Pass via --argjson so 600 stays a number, true/false stay bools, etc.
+        if ! jq --arg k "$key" --argjson v "$value" '.[$k] = $v' "$file" > "$tmp"; then
+            rm -f "$tmp"; die "jq failed (set $key = $value)"
+        fi
+    else
+        if ! jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$file" > "$tmp"; then
+            rm -f "$tmp"; die "jq failed (set $key = $value)"
+        fi
+    fi
+    mv "$tmp" "$file"
+
+    # Echo back the stored value so user can verify type.
+    local stored
+    stored=$(jq -c --arg k "$key" '.[$k]' "$file")
+    echo "✅ set $key = $stored  in $file"
+}
+
+_ar_config_cmd_unset() {
+    local key="" repo=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            -*) die "unknown option: $1" ;;
+            *) key="$1"; shift ;;
+        esac
+    done
+    [ -z "$key" ] && die "usage: autoreviewer config unset <key> [--repo PATH]"
+
+    local file
+    file=$(_ar_config_target_file "$repo")
+    if [ ! -f "$file" ]; then
+        echo "ℹ️  $file does not exist — nothing to unset."
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp) || die "mktemp failed"
+    if ! jq --arg k "$key" 'del(.[$k])' "$file" > "$tmp"; then
+        rm -f "$tmp"; die "jq failed (unset $key)"
+    fi
+    mv "$tmp" "$file"
+    echo "🧹 unset $key in $file"
+}
+
+_ar_config_cmd_list() {
+    local repo=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --repo) repo="$2"; shift 2 ;;
+            -*) die "unknown option: $1" ;;
+            *) die "unknown arg: $1" ;;
+        esac
+    done
+
+    local file
+    file=$(_ar_config_target_file "$repo")
+    if [ -f "$file" ]; then
+        echo "# $file"
+        jq . "$file"
+    else
+        echo "# $file"
+        echo "(does not exist — using built-in defaults)"
+    fi
+}
+
+cmd_config() {
+    local sub="${1:-list}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        get)    _ar_config_cmd_get "$@" ;;
+        set)    _ar_config_cmd_set "$@" ;;
+        unset)  _ar_config_cmd_unset "$@" ;;
+        list)   _ar_config_cmd_list "$@" ;;
+        -h|--help|help)
+            cat <<'EOF'
+Usage:
+  autoreviewer config list [--repo PATH]
+  autoreviewer config get <key> [--repo PATH]
+  autoreviewer config set <key> <value> [--repo PATH]
+  autoreviewer config unset <key> [--repo PATH]
+
+Without --repo, edits the GLOBAL config at ~/.autoreviewer/config.json.
+With --repo, edits the per-repo override at <repo>/.git/autoreviewer.json
+(per-repo values override global on a key-by-key basis).
+
+VALUE is parsed as JSON when valid (so 600 → number, true → bool, "x" →
+string). Bare strings without quotes are also accepted as strings, e.g.
+  autoreviewer config set command claude
+
+Common keys (defaults shown):
+  timeout_seconds   600         seconds before review command is killed
+  command           claude      the review tool to invoke
+  command_args      ["-p"]      extra argv appended to command
+  notification      terminal-notifier   terminal-notifier | osascript | none
+  notify_threshold  low         minimum severity for completion notification
+  notify_start      true        fire a "started" notification on commit
+  language          zh          report language: zh | en
+  auto_open         on_high     auto-open .md: false | true | on_high
+  enabled           true        master switch (or per-repo: pause this repo)
+
+Examples:
+  autoreviewer config set timeout_seconds 600
+  autoreviewer config set --repo . enabled false
+  autoreviewer config get timeout_seconds
+  autoreviewer config list
+EOF
+            ;;
+        *) die "unknown subcommand: $sub (try: get|set|unset|list)" ;;
     esac
 }
 
@@ -1050,10 +1623,11 @@ cmd_uninstall() {
         echo "  ⚠️  core.hooksPath is $current (not us); leaving alone"
     fi
 
-    # Remove shell rc hook BEFORE rm -rf so the helper functions are still
-    # in memory (they were sourced from lib/config.sh at script start, but
-    # the rc cleanup itself doesn't depend on the lib being on disk).
+    # Remove shell rc additions BEFORE rm -rf so the helper functions are
+    # still in memory (they were sourced from lib/config.sh at script start,
+    # but the rc cleanup itself doesn't depend on the lib being on disk).
     _ar_shell_hook_uninstall
+    _ar_path_hook_uninstall
 
     rm -rf "$AUTOREVIEWER_HOME"
     rm -f "$HOME/.local/bin/autoreviewer"
@@ -1091,6 +1665,8 @@ case "$cmd" in
     cancel)    cmd_cancel "$@" ;;
     heal)      cmd_heal "$@" ;;
     shell-hook|shellhook) cmd_shell_hook "$@" ;;
+    path-hook|pathhook)   cmd_path_hook "$@" ;;
+    config)    cmd_config "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     help|-h|--help) cmd_help ;;
     *) die "unknown command: $cmd (try 'autoreviewer help')" ;;

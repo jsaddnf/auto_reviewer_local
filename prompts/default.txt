@@ -14,15 +14,15 @@ CRITICAL RULES:
 
 SCHEMA:
 {
-  "summary": "<one or two sentence overall summary>",
+  "summary": "<one-sentence overall assessment in the user's preferred language>",
   "severity": "ok" | "low" | "medium" | "high",
   "issues": [
     {
-      "file": "<repo-relative path>",
-      "line": <integer>,
       "level": "low" | "medium" | "high",
-      "message": "<clear description of the issue>",
-      "suggestion": "<concrete fix idea>"
+      "file": "<repo-relative path>",
+      "line": <integer line number, 0 if not applicable>,
+      "message": "<what's wrong>",
+      "suggestion": "<how to fix>"
     }
   ],
   "impact": {

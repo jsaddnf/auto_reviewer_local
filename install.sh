@@ -179,7 +179,7 @@ if [ ! -f "$AUTOREVIEWER_HOME/config.json" ]; then
   "notify_start": true,
   "language": "zh",
   "auto_open": "on_high",
-  "timeout_seconds": 180,
+  "timeout_seconds": 600,
   "disabled_repos": [],
   "source_dir": "$SCRIPT_DIR"
 }
@@ -192,10 +192,15 @@ else
     # would silently flip a user's `notify_start: false` back to true.
     if command -v jq >/dev/null 2>&1; then
         tmp=$(mktemp)
+        # Use has() not //=, because //= treats `false`/`0` as missing and
+        # would silently flip a user's deliberate `notify_start: false` or
+        # `timeout_seconds: 0` back to the default. has() respects
+        # explicit user values.
         jq --arg s "$SCRIPT_DIR" '
             .source_dir = $s
-            | (if has("notify_start") then . else .notify_start = true end)
-            | (if has("language")     then . else .language     = "zh" end)
+            | (if has("notify_start")    then . else .notify_start    = true end)
+            | (if has("language")        then . else .language        = "zh" end)
+            | (if has("timeout_seconds") then . else .timeout_seconds = 600 end)
         ' "$AUTOREVIEWER_HOME/config.json" > "$tmp" \
             && mv "$tmp" "$AUTOREVIEWER_HOME/config.json"
         echo "  ✅ updated source_dir + ensured new fields in config.json"
@@ -210,8 +215,14 @@ chmod +x "$BIN_DIR/autoreviewer"
 
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
     echo ""
-    echo "⚠️  $BIN_DIR is not in your PATH. Add this to ~/.zshrc or ~/.bashrc:"
-    echo "     export PATH=\"$BIN_DIR:\$PATH\""
+    echo "ℹ️  $BIN_DIR is not in your current PATH. Adding it to your shell rc..."
+    # Delegate to the CLI we just installed (use absolute path since PATH
+    # isn't set yet). path-hook install is idempotent and writes a marker
+    # block so 'autoreviewer uninstall' can clean it up later.
+    "$BIN_DIR/autoreviewer" path-hook install "$BIN_DIR" || {
+        echo "⚠️  path-hook install failed. Manually add this to your shell rc:"
+        echo "     export PATH=\"$BIN_DIR:\$PATH\""
+    }
 fi
 
 # ---------- 6. legacy global core.hooksPath check ----------

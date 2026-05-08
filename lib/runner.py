@@ -12,6 +12,13 @@ Usage:
     runner.py <commit> --sync      # foreground, prints result
     runner.py <commit> --no-notify # skip notification
 """
+# PEP 563: defer annotation evaluation to strings so we can use the modern
+# `X | None` / `Path | str` union syntax without requiring Python 3.10+.
+# Some macOS systems still ship Python 3.9 as /usr/bin/python3, and we don't
+# want to break review on those. Annotations are still readable by IDEs and
+# type-checkers — they're just not evaluated at runtime.
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -28,7 +35,10 @@ GLOBAL_CONFIG = AUTOREVIEWER_HOME / "config.json"
 DEFAULT_PROMPT = AUTOREVIEWER_HOME / "prompts" / "default.txt"
 
 SEVERITY_RANK = {"ok": 0, "low": 1, "medium": 2, "high": 3}
-SEVERITY_EMOJI = {"ok": "🟢", "low": "🟡", "medium": "🟡", "high": "🔴"}
+# Distinct colors per level so users can tell low/medium apart at a glance
+# in notifications, the .md report, and `autoreviewer log` output:
+#   ok=green, low=yellow, medium=orange, high=red.
+SEVERITY_EMOJI = {"ok": "🟢", "low": "🟡", "medium": "🟠", "high": "🔴"}
 
 # Localized strings for the rendered report and notifications. Selected by
 # config["language"] (default "zh"). Header metadata (Code Review/Commit/
@@ -57,9 +67,30 @@ LABELS = {
         "raw_output_pointer": "原始输出",
         "raw_output_preview": "原始输出预览",
         "raw_output_truncated": "（已截断，完整内容见 raw 文件）",
+        # squash-review header
+        "squash_label": "Squash Review",
+        "squash_commit_count": "包含 {n} 个 commit",
+        "constituent_commits_section": "包含的 commit",
+        # command-failure report. Bodies/hints take .format() args as
+        # noted; resolve at call sites with labels[key].format(...).
+        "command_failed_status": "命令执行失败",
+        "command_not_found_status": "找不到 review 命令",
+        "timeout_status": "审核超时",
+        "command_not_found_body": "`{cmd}` 不在 PATH 中。",
+        "command_not_found_hint": "检查 review 工具是否已安装，或修改 ~/.autoreviewer/config.json 的 `command` 字段。",
+        "timeout_body": "`{cmd}` 在 {timeout} 秒内未返回。",
+        "timeout_hint": "提高 ~/.autoreviewer/config.json 中的 `timeout_seconds`，或检查 review 工具是否卡死。",
+        "command_failed_body": "`{cmd}` 退出码 {rc}",
+        "auth_required_hint": "需要登录：请先完成 review 工具的认证后重试（Claude Code: 运行 `claude /login`）。",
+        "stderr_section": "stderr",
+        "see_full_log": "完整日志见",
         # notifications
         "started_message": "⏳ 后台审核中",
         "click_to_open": "点击查看",
+        "auth_required_message": "🔑 需要登录 · 点击查看",
+        "command_failed_message": "❌ Review 失败 · 点击查看",
+        "timeout_message_failure": "⏱ Review 超时 · 点击查看",
+        "command_not_found_message": "❌ 找不到 review 命令 · 点击查看",
         "issue_word": "个问题",         # singular
         "issues_word": "个问题",        # plural — Chinese has no count agreement
         # prompt directive
@@ -89,8 +120,26 @@ LABELS = {
         "raw_output_pointer": "Raw output",
         "raw_output_preview": "Raw output preview",
         "raw_output_truncated": "(truncated, see raw file for full output)",
+        "squash_label": "Squash Review",
+        "squash_commit_count": "spans {n} commit(s)",
+        "constituent_commits_section": "Constituent commits",
+        "command_failed_status": "Command failed",
+        "command_not_found_status": "Review command not found",
+        "timeout_status": "Review timed out",
+        "command_not_found_body": "`{cmd}` is not in PATH.",
+        "command_not_found_hint": "Check the review tool is installed, or update the `command` field in ~/.autoreviewer/config.json.",
+        "timeout_body": "`{cmd}` did not return within {timeout}s.",
+        "timeout_hint": "Raise `timeout_seconds` in ~/.autoreviewer/config.json, or investigate whether the review tool is stuck.",
+        "command_failed_body": "`{cmd}` exited with code {rc}",
+        "auth_required_hint": "Login required: authenticate the review tool first (Claude Code: run `claude /login`).",
+        "stderr_section": "stderr",
+        "see_full_log": "Full log at",
         "started_message": "⏳ Running review in background",
         "click_to_open": "click to open",
+        "auth_required_message": "🔑 Login required · click for details",
+        "command_failed_message": "❌ Review failed · click for details",
+        "timeout_message_failure": "⏱ Review timed out · click for details",
+        "command_not_found_message": "❌ Review command not found · click for details",
         "issue_word": "issue",
         "issues_word": "issues",
         "prompt_directive": (
@@ -125,7 +174,7 @@ def load_config(repo_root: Path) -> dict:
         "notification": "terminal-notifier",
         "notify_threshold": "low",
         "auto_open": "on_high",
-        "timeout_seconds": 180,
+        "timeout_seconds": 600,
         "disabled_repos": [],
     }
     if GLOBAL_CONFIG.exists():
@@ -145,7 +194,16 @@ def load_config(repo_root: Path) -> dict:
 # ---------- git helpers ----------
 
 def git(*args, cwd=None) -> str:
-    return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
+    """Run git with English output forced. We parse `--shortstat`,
+    `log --format`, and other output below using English-keyword regexes
+    ('insertion', 'deletion', etc.). If the user's environment has
+    LC_ALL=zh_CN.UTF-8 or similar, the stat strings localize and our
+    regex silently returns 0 for everything. LC_ALL=C makes git output
+    stable, locale-independent text."""
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    return subprocess.check_output(
+        ["git", *args], cwd=cwd, text=True, env=env,
+    ).strip()
 
 
 def get_commit_info(commit: str, repo_root: Path) -> dict:
@@ -167,21 +225,91 @@ def get_commit_info(commit: str, repo_root: Path) -> dict:
         "files_changed": files_changed,
         "additions": additions,
         "deletions": deletions,
+        "is_squash": False,
     }
 
 
-def get_diff(commit: str, repo_root: Path) -> str:
-    return git("show", "--no-color", commit, cwd=repo_root)
+def get_squash_info(spec: str, repo_root: Path) -> dict:
+    """Build a synthetic 'info' dict for a squashed range like 'HEAD~3..HEAD'
+    or 'main..feature'. Combines stats across the range and uses a synthetic
+    short_hash of '<base_short>..<tip_short>' so the .md report and log
+    entry are recognizable as a multi-commit review."""
+    if ".." not in spec:
+        raise ValueError(f"not a range spec: {spec}")
+    base, tip = spec.split("..", 1)
+    if not base:
+        raise ValueError(f"empty base in range: {spec}")
+    if not tip:
+        tip = "HEAD"
+
+    base_full = git("rev-parse", base, cwd=repo_root)
+    tip_full = git("rev-parse", tip, cwd=repo_root)
+    base_short = git("rev-parse", "--short", base_full, cwd=repo_root)
+    tip_short = git("rev-parse", "--short", tip_full, cwd=repo_root)
+
+    # Walk the range to count + sample messages. --reverse so [0] is oldest.
+    range_spec = f"{base_full}..{tip_full}"
+    rev_list_out = git("rev-list", "--reverse", range_spec, cwd=repo_root)
+    commits = [c for c in rev_list_out.splitlines() if c]
+    if not commits:
+        raise ValueError(f"empty commit range: {spec}")
+
+    first_msg = git("log", "-1", "--format=%s", commits[0], cwd=repo_root)
+    last_msg = git("log", "-1", "--format=%s", commits[-1], cwd=repo_root)
+    n = len(commits)
+    if n == 1:
+        message = first_msg
+    elif n == 2:
+        message = f"{first_msg} → {last_msg}"
+    else:
+        message = f"{first_msg} → ... → {last_msg} ({n} commits)"
+
+    # Author: the author of the OLDEST commit in the range. For a feature
+    # branch this is usually the same person across commits.
+    author = git("log", "-1", "--format=%an", commits[0], cwd=repo_root)
+    # Date: the tip commit's date (when the latest change happened).
+    date = git("log", "-1", "--format=%aI", tip_full, cwd=repo_root)
+
+    # Stats from the combined diff.
+    stats = git("diff", "--shortstat", range_spec, cwd=repo_root)
+    additions = sum(int(m) for m in re.findall(r"(\d+) insertion", stats))
+    deletions = sum(int(m) for m in re.findall(r"(\d+) deletion", stats))
+    files_changed = sum(int(m) for m in re.findall(r"(\d+) file", stats))
+
+    return {
+        "full_hash": f"{base_full}..{tip_full}",
+        "short_hash": f"{base_short}..{tip_short}",
+        "message": message,
+        "author": author,
+        "date": date,
+        "files_changed": files_changed,
+        "additions": additions,
+        "deletions": deletions,
+        "is_squash": True,
+        "commit_count": n,
+        "constituent_commits": commits,  # list of full hashes
+        "repo_root": str(repo_root),     # for render_markdown to look up subjects
+    }
+
+
+def get_diff(commit_or_range: str, repo_root: Path) -> str:
+    """For a single commit, returns `git show` output. For a range
+    ('base..tip'), returns the combined `git diff base..tip` — i.e. the net
+    change across the entire range, which is what we want to LLM-review in
+    squash mode."""
+    if ".." in commit_or_range:
+        return git("diff", "--no-color", commit_or_range, cwd=repo_root)
+    return git("show", "--no-color", commit_or_range, cwd=repo_root)
 
 
 # ---------- review invocation ----------
 
-def _balance_brackets(text: str):
+def _balance_brackets(text: str) -> str | None:
     """Append missing closing braces/brackets at the end based on a string-aware
     paren stack. Returns repaired text, or None if nothing to repair."""
     in_string = False
     escape = False
-    stack = []
+    stack: list[str] = []
     for ch in text:
         if escape:
             escape = False
@@ -272,6 +400,18 @@ def extract_json(text: str) -> dict:
     raise ValueError("Could not extract valid JSON from output")
 
 
+class CommandFailed(RuntimeError):
+    """Structured failure from the review command. Carries the raw stderr
+    separately so the failure handler can render a clean .md (one-line body
+    + dedicated stderr section) instead of duplicating the stderr."""
+
+    def __init__(self, cmd: str, returncode: int, stderr: str):
+        super().__init__(f"{cmd} failed (exit {returncode}): {stderr}")
+        self.cmd = cmd
+        self.returncode = returncode
+        self.stderr = stderr or ""
+
+
 def run_review_command(cmd: str, prompt: str, timeout: int, extra_args=None) -> str:
     """Invoke the review backend (Claude Code by default).
 
@@ -279,6 +419,9 @@ def run_review_command(cmd: str, prompt: str, timeout: int, extra_args=None) -> 
     delivered via stdin to avoid OS command-line length limits. Claude Code
     invoked as ``claude -p`` reads stdin as the prompt, runs once
     non-interactively, and prints the response to stdout.
+
+    Raises CommandFailed (with structured stderr) when the backend returns
+    a non-zero exit code, so the caller can render a useful failure report.
     """
     extra_args = list(extra_args or [])
     # Default extra args: just `-p` (non-interactive print mode for Claude Code).
@@ -292,7 +435,7 @@ def run_review_command(cmd: str, prompt: str, timeout: int, extra_args=None) -> 
         timeout=timeout,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"{cmd} failed (exit {proc.returncode}): {proc.stderr}")
+        raise CommandFailed(cmd, proc.returncode, proc.stderr)
     return proc.stdout
 
 
@@ -332,22 +475,46 @@ def repair_with_llm(cmd: str, raw: str, timeout: int, extra_args=None) -> dict:
 
 # ---------- rendering ----------
 
-def render_markdown(review: dict, info: dict, labels=None) -> str:
+def render_markdown(review: dict, info: dict, labels: dict | None = None) -> str:
     if labels is None:
         labels = LABELS["zh"]
     sev = (review.get("severity") or "ok").lower()
     sev_emoji = SEVERITY_EMOJI.get(sev, "⚪")
+    is_squash = bool(info.get("is_squash"))
 
+    title = f"# Code Review · {info['short_hash']}"
+    if is_squash:
+        title += f" · {labels['squash_label']}"
     out = [
-        f"# Code Review · {info['short_hash']}",
+        title,
         "",
         f"**Commit**: {info['message']}",
         f"**Author**: {info['author']}",
         f"**Date**: {info['date']}",
         f"**Files**: {info['files_changed']} changed (+{info['additions']} -{info['deletions']})",
         f"**Severity**: {sev_emoji} {sev.upper()}",
-        "",
     ]
+    if is_squash:
+        n = info.get("commit_count", 0)
+        out.append(f"**Span**: {labels['squash_commit_count'].format(n=n)}")
+    out.append("")
+
+    # In squash mode, list the constituent commits (short_hash + subject)
+    # so the reviewer can see exactly what's bundled. Helpful for
+    # cross-referencing review findings to specific commits.
+    if is_squash:
+        constituent = info.get("constituent_commits") or []
+        if constituent:
+            out += [f"## {labels['constituent_commits_section']}", ""]
+            repo_root = Path(info.get("repo_root", "."))
+            for full in constituent:
+                try:
+                    short = git("rev-parse", "--short", full, cwd=repo_root)
+                    subject = git("log", "-1", "--format=%s", full, cwd=repo_root)
+                    out.append(f"- `{short}` {subject}")
+                except Exception:
+                    out.append(f"- `{full[:7]}`")
+            out.append("")
 
     summary = review.get("summary", "").strip()
     if summary:
@@ -441,7 +608,104 @@ def render_markdown(review: dict, info: dict, labels=None) -> str:
     return "\n".join(out)
 
 
-def render_failure_markdown(info: dict, errors, raw_path: Path, raw: str, labels=None) -> str:
+# ---------- failure detection ----------
+
+# Heuristic patterns matched against the review command's stderr / error
+# message to decide whether the failure is an auth/login problem. These are
+# matched case-insensitively. The list intentionally errs on the side of
+# false-positive — telling the user "looks like login required" when it
+# wasn't is much better UX than missing a real auth failure.
+_AUTH_FAILURE_PATTERNS = [
+    r"\bnot authenticated\b",
+    r"\bplease log ?in\b",
+    r"\blogin required\b",
+    r"\bunauthori[sz]ed\b",
+    r"\bforbidden\b",
+    r"\bauthentication (failed|required|error)\b",
+    r"\bauth (failed|required|error)\b",
+    r"\bnot logged in\b",
+    r"\btoken (has )?expired\b",
+    r"\bexpired token\b",
+    r"\binvalid token\b",
+    r"\bmissing (api[_ ]?key|credential)\b",
+    r"\binvalid (api[_ ]?key|credential)\b",
+    r"\bno (api[_ ]?key|credential)\b",
+    # 401/403 only when accompanied by HTTP/status/code context, or
+    # followed by Unauthorized/Forbidden. Bare "\b401\b" matches stuff
+    # like "request size 401 bytes" or "/page-401.html".
+    r"\bhttp[ /]?40[13]\b",
+    r"\b(status|code|error)[ :=]+40[13]\b",
+    r"\b40[13][ :]+(unauthori[sz]ed|forbidden)\b",
+]
+
+_AUTH_FAILURE_RE = re.compile("|".join(_AUTH_FAILURE_PATTERNS), re.IGNORECASE)
+
+
+def detect_auth_failure(text: str) -> bool:
+    """Return True if `text` looks like an authentication / login failure
+    message from the review command. False-positive prone by design."""
+    if not text:
+        return False
+    return bool(_AUTH_FAILURE_RE.search(text))
+
+
+def render_command_failure_markdown(
+    info: dict,
+    status: str,
+    error_message: str,
+    stderr_text: str,
+    hint: str | None,
+    log_path: Path | str | None,
+    labels: dict | None = None,
+) -> str:
+    """Degraded report written when the review command itself fails (non-zero
+    exit, timeout, or not-found). Mirrors render_failure_markdown's structure
+    so click-to-open from the notification still lands on a useful page.
+
+    log_path is included in the output ONLY when non-None — caller passes
+    None when no full-log file was actually written (e.g. stderr is short
+    enough to be fully shown inline). This avoids dangling pointers to
+    files that don't exist.
+    """
+    if labels is None:
+        labels = LABELS["zh"]
+    out = [
+        f"# Code Review · {info['short_hash']} · ⚠️ {status.upper()}",
+        "",
+        f"**Commit**: {info['message']}",
+        f"**Author**: {info['author']}",
+        f"**Date**: {info['date']}",
+        f"**Files**: {info['files_changed']} changed (+{info['additions']} -{info['deletions']})",
+        "",
+        f"## {status}",
+        "",
+        error_message,
+        "",
+    ]
+    if hint:
+        out += [f"**👉 {hint}**", ""]
+    if stderr_text and stderr_text.strip():
+        snippet = stderr_text[:4000]
+        truncated = len(stderr_text) > 4000
+        if truncated:
+            snippet += f"\n\n... {labels['raw_output_truncated']}"
+        out += [
+            f"## {labels['stderr_section']}",
+            "",
+            "```",
+            snippet,
+            "```",
+            "",
+        ]
+    if log_path is not None:
+        out += [f"{labels['see_full_log']}: `{log_path}`", ""]
+    return "\n".join(out)
+
+
+def render_failure_markdown(
+    info: dict, errors: list[str], raw_path: Path, raw: str,
+    labels: dict | None = None,
+) -> str:
     """Degraded report written when JSON parsing (and LLM repair) all fail.
     Ensures `--open` and the click-to-open notification still land somewhere."""
     if labels is None:
@@ -480,7 +744,13 @@ def render_failure_markdown(info: dict, errors, raw_path: Path, raw: str, labels
 
 # ---------- notifications ----------
 
-def _send_notification(title: str, subtitle: str, message: str, mode: str, click_target=None):
+def _send_notification(
+    title: str,
+    subtitle: str,
+    message: str,
+    mode: str,
+    click_target: Path | None = None,
+) -> None:
     """Internal: dispatch a desktop notification across supported backends.
 
     Args:
@@ -519,7 +789,7 @@ def notify(title: str, subtitle: str, message: str, file_path: Path, mode: str):
     _send_notification(title, subtitle, message, mode, click_target=file_path)
 
 
-def notify_started(title: str, subtitle: str, mode: str, message=None):
+def notify_started(title: str, subtitle: str, mode: str, message: str | None = None):
     """Fire a "review started" notification — no click target (the .md doesn't
     exist yet). Used by manual `autoreviewer run` and any non-hook code path.
     The post-commit hook fires its own shell-side notification synchronously
@@ -577,8 +847,11 @@ def main():
     cfg = load_config(repo_root)
     labels = get_labels(cfg.get("language", "zh"))
 
-    # Resolve commit info
-    info = get_commit_info(args.commit, repo_root)
+    # Resolve commit info — squash mode is auto-detected by '..' in the arg.
+    if ".." in args.commit:
+        info = get_squash_info(args.commit, repo_root)
+    else:
+        info = get_commit_info(args.commit, repo_root)
     short = info["short_hash"]
     repo_name = repo_root.name  # used in notification titles to disambiguate
                                  # autoreviewer notifications across multiple repos
@@ -602,7 +875,13 @@ def main():
 
         # Build file paths
         date_tag = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        base = f"{date_tag}_{short}"
+        # Sanitize short hash for filename: squash hashes look like
+        # 'abc1234..def5678', which is technically a valid filename but the
+        # '..' confuses some shell globs/tab-completion. Replace with '_to_'
+        # for the on-disk filename only — the .md/notification body still
+        # show the canonical 'abc..def' form.
+        short_for_file = short.replace("..", "_to_")
+        base = f"{date_tag}_{short_for_file}"
         json_path = reviews_dir / f"{base}.json"
         md_path = reviews_dir / f"{base}.md"
         raw_path = reviews_dir / f"{base}.raw.txt"
@@ -630,9 +909,53 @@ def main():
 
         # Run command
         cmd = cfg["command"]
+
+        # Helper closure: write a degraded .md, fire a failure notification,
+        # exit with the given code. Used by every failure branch below so the
+        # user always sees SOMETHING (instead of silent failure).
+        #
+        # If stderr_text is long (>4000 chars) we ALSO dump the full thing to
+        # a sibling .stderr.log next to the .md, and the rendered markdown
+        # gets a "Full log at: ..." pointer. For short stderr, the inline
+        # block in the .md is the whole thing — no log file written, no
+        # dangling pointer.
+        def _fail(status: str, error_message: str, stderr_text: str,
+                  hint: str | None, notify_message: str, exit_code: int) -> None:
+            log_pointer = None
+            if stderr_text and len(stderr_text) > 4000:
+                stderr_log = md_path.with_suffix(".stderr.log")
+                try:
+                    stderr_log.write_text(stderr_text)
+                    log_pointer = stderr_log
+                except OSError as ex:
+                    print(f"[autoreviewer] Could not write stderr log: {ex}",
+                          file=sys.stderr)
+            md_path.write_text(render_command_failure_markdown(
+                info, status, error_message, stderr_text, hint,
+                log_pointer, labels=labels,
+            ))
+            if not args.no_notify:
+                notify(
+                    title=f"autoreviewer · {repo_name}",
+                    subtitle=f"{short} · {info['message'][:75]}",
+                    message=notify_message,
+                    file_path=md_path,
+                    mode=cfg.get("notification", "terminal-notifier"),
+                )
+            if args.open:
+                subprocess.Popen(["open", str(md_path)])
+            sys.exit(exit_code)
+
         if not shutil.which(cmd):
             print(f"[autoreviewer] Command not found: {cmd}", file=sys.stderr)
-            sys.exit(2)
+            _fail(
+                status=labels["command_not_found_status"],
+                error_message=labels["command_not_found_body"].format(cmd=cmd),
+                stderr_text="",
+                hint=labels["command_not_found_hint"],
+                notify_message=labels["command_not_found_message"],
+                exit_code=2,
+            )
 
         print(f"[autoreviewer] Reviewing {short}: {info['message']}", file=sys.stderr)
 
@@ -657,13 +980,38 @@ def main():
                 extra_args=cfg.get("command_args"),
             )
         except subprocess.TimeoutExpired:
-            print(f"[autoreviewer] Review timed out after {cfg['timeout_seconds']}s", file=sys.stderr)
-            sys.exit(3)
+            print(f"[autoreviewer] Review timed out after {cfg['timeout_seconds']}s",
+                  file=sys.stderr)
+            _fail(
+                status=labels["timeout_status"],
+                error_message=labels["timeout_body"].format(
+                    cmd=cmd, timeout=cfg["timeout_seconds"]),
+                stderr_text="",
+                hint=labels["timeout_hint"],
+                notify_message=labels["timeout_message_failure"],
+                exit_code=3,
+            )
+        except CommandFailed as e:
+            # Non-zero exit from the review command. Use structured fields
+            # (e.cmd / e.returncode / e.stderr) so the .md has a clean
+            # one-line body and a separate stderr block — no duplication.
+            print(f"[autoreviewer] Review command failed: {e}", file=sys.stderr)
+            is_auth = detect_auth_failure(e.stderr)
+            _fail(
+                status=labels["command_failed_status"],
+                error_message=labels["command_failed_body"].format(
+                    cmd=e.cmd, rc=e.returncode),
+                stderr_text=e.stderr,
+                hint=labels["auth_required_hint"] if is_auth else None,
+                notify_message=(labels["auth_required_message"] if is_auth
+                                else labels["command_failed_message"]),
+                exit_code=5,
+            )
         elapsed = time.time() - t0
         print(f"[autoreviewer] Command done in {elapsed:.1f}s, parsing...", file=sys.stderr)
 
         review = None
-        errors = []
+        errors: list[str] = []
         try:
             review = extract_json(raw)
         except Exception as e:
